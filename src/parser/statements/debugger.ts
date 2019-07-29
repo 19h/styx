@@ -1,12 +1,12 @@
 import * as ESTree from "../../estree";
-import { Completion, FlowNode, ParsingContext } from "../../flow";
+import {Completion, FlowNode, ParsingContext} from "../../flow";
 
-export { parseDebuggerStatement };
+export {parseDebuggerStatement};
 
 function parseDebuggerStatement(
-  debuggerStatement: ESTree.DebuggerStatement,
-  currentNode: FlowNode,
-  context: ParsingContext
+    debuggerStatement: ESTree.DebuggerStatement,
+    currentNode: FlowNode,
+    context: ParsingContext
 ): Completion {
-  return { normal: currentNode };
+    return {normal: currentNode};
 }

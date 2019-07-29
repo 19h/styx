@@ -1,5 +1,7 @@
 /* global $ */
 
+const $ = require('../vendor/scripts/jquery.min');
+
 (function() {
   $.fn.setCaretPosition = function(position) {
     return this.each(function() {

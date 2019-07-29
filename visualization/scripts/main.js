@@ -1,6 +1,12 @@
 /* global $ */
 /* global ko */
 
+const ko = require('../vendor/scripts/knockout.min');
+const _ = require('../vendor/scripts/lodash');
+const $ = require('../vendor/scripts/jquery.min');
+
+import * as gviz from './graph-visualization';
+
 (function() {
   var $visualization = $("#visualization");
   $visualization.removeClass("fading--faded-out");
@@ -78,8 +84,8 @@
   var debouncedParseAndVisualize = _.debounce(parseAndVisualize, 200);
 
   var $input = $("#input")
-    .on("keydown", keydown)
-    .on("keyup", keyup);
+      .on('keydown', keydown)
+      .on('keyup', keyup);
 
   initializeFormFromSessionStorage();
   parseAndVisualize();
@@ -113,7 +119,7 @@
     try {
       viewModel.error(null);
 
-      var program = window.cfgVisualization.parseProgram(code, options);
+      var program = gviz.parseProgram(code, options);
       viewModel.program(program);
 
       var functions = _(program.functions)
@@ -143,7 +149,7 @@
       ? selectedFunction.flowGraph
       : program.flowGraph;
 
-    window.cfgVisualization.renderControlFlowGraph(container, flowGraph);
+    gviz.renderControlFlowGraph(container, flowGraph);
   }
 
   function keydown(e) {

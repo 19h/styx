@@ -1,35 +1,35 @@
-import { stringify } from "../expressions/stringifier";
+import {stringify} from "../expressions/stringifier";
 
 import * as ESTree from "../../estree";
-import { createAssignmentExpression } from "../../estreeFactory";
+import {createAssignmentExpression} from "../../estreeFactory";
 
-import { Completion, FlowNode, ParsingContext } from "../../flow";
+import {Completion, FlowNode, ParsingContext} from "../../flow";
 
-export { parseVariableDeclaration };
+export {parseVariableDeclaration};
 
 function parseVariableDeclaration(
-  declaration: ESTree.VariableDeclaration,
-  currentNode: FlowNode,
-  context: ParsingContext
+    declaration: ESTree.VariableDeclaration,
+    currentNode: FlowNode,
+    context: ParsingContext
 ): Completion {
-  for (let declarator of declaration.declarations) {
-    let declarationExpression = declarator.init
-      ? createAssignmentExpressionFrom(declarator)
-      : declarator.id;
+    for (let declarator of declaration.declarations) {
+        let declarationExpression = declarator.init
+            ? createAssignmentExpressionFrom(declarator)
+            : declarator.id;
 
-    currentNode = context
-      .createNode()
-      .appendTo(currentNode, stringify(declarationExpression), declarator);
-  }
+        currentNode = context
+            .createNode()
+            .appendTo(currentNode, stringify(declarationExpression), declarator);
+    }
 
-  return { normal: currentNode };
+    return {normal: currentNode};
 }
 
 function createAssignmentExpressionFrom(
-  declarator: ESTree.VariableDeclarator
+    declarator: ESTree.VariableDeclarator
 ): ESTree.Expression {
-  return createAssignmentExpression({
-    left: declarator.id,
-    right: declarator.init
-  });
+    return createAssignmentExpression({
+        left: declarator.id,
+        right: declarator.init
+    });
 }
