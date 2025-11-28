@@ -47,10 +47,30 @@ pub fn apply_response_headers<B>(response: &mut Response<B>, rules: &HeaderRules
             } else if let Some(existing) = headers.get(&header_name) {
                 // Merge: append with comma separator for most headers
                 let separator = ", ";
+                let existing_str = existing.to_str().unwrap_or("");
+
+                // Check if value is already present in existing header (idempotent merge)
+                // This prevents duplication in proxy loop scenarios
+                // Handle both exact match and substring match with proper boundaries
+                if existing_str == value {
+                    // Exact match - value is already the entire header
+                    continue;
+                }
+
+                // Check if value appears as a complete segment (with comma boundaries)
+                // For "public, max-age=3600", check boundaries: start, ", {value}", or "{value}, "
+                let value_with_leading = format!(", {}", value);
+                let value_with_trailing = format!("{}, ", value);
+                if existing_str.starts_with(&format!("{}, ", value))
+                    || existing_str.ends_with(&value_with_leading)
+                    || existing_str.contains(&value_with_trailing) {
+                    // Value already present as a complete segment
+                    continue;
+                }
 
                 let merged = format!(
                     "{}{}{}",
-                    existing.to_str().unwrap_or(""),
+                    existing_str,
                     separator,
                     value
                 );
@@ -129,19 +149,25 @@ pub fn apply_request_headers(headers: &mut HeaderMap, rules: &HeaderRules) {
 }
 
 /// Standard security headers
+///
+/// Provides basic security headers that don't break functionality.
+/// For stricter policies (CSP, HSTS, Permissions-Policy), configure them explicitly in your config.
 pub fn default_security_headers() -> HeaderRules {
     HeaderRules {
         set_if_empty: vec![
             ("X-Xss-Protection".to_string(), "1; mode=block".to_string()),
             ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
-            // ("Access-Control-Allow-Origin", "*")
-            // Admins should explicitly configure CORS if needed
             ("Referrer-Policy".to_string(), "strict-origin-when-cross-origin".to_string()),
-            // Add missing security headers
             ("X-Frame-Options".to_string(), "SAMEORIGIN".to_string()),
-            ("Strict-Transport-Security".to_string(), "max-age=31536000; includeSubDomains".to_string()),
-            ("Content-Security-Policy".to_string(), "default-src 'self'".to_string()),
-            ("Permissions-Policy".to_string(), "geolocation=(), microphone=(), camera=()".to_string()),
+            // Cache-Control: only set if upstream doesn't provide it (use set_if_empty not merge)
+            (
+                "Cache-Control".to_string(),
+                "public, stale-while-revalidate=31536000, stale-if-error=31536000, max-age=7200, max-stale=86400".to_string(),
+            ),
+            // CORS explicitly removed - admins should configure if needed
+            // CSP removed from defaults - too strict, breaks directory listings and inline scripts
+            // HSTS removed from defaults - should be opt-in as it locks users into HTTPS
+            // Permissions-Policy removed from defaults - features not widely supported
         ],
         unset: vec![
             "X-Powered-By".to_string(),
@@ -149,10 +175,7 @@ pub fn default_security_headers() -> HeaderRules {
             "x-varnish".to_string(),
             "Server".to_string(), // Hide server version
         ],
-        merge: vec![(
-            "Cache-Control".to_string(),
-            "public, stale-while-revalidate=31536000, stale-if-error=31536000, max-age=7200, max-stale=86400".to_string(),
-        )],
+        merge: vec![],
         set: vec![],
     }
 }
@@ -630,6 +653,58 @@ mod tests {
         // value depends on the order of merge operations
     }
 
+    #[test]
+    fn test_apply_merge_idempotent() {
+        // Test that merging the same value multiple times doesn't duplicate it
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("Cache-Control", "public")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let rules = HeaderRules {
+            merge: vec![("Cache-Control".to_string(), "max-age=3600".to_string())],
+            ..Default::default()
+        };
+
+        // Apply the same merge rule multiple times (simulating proxy loop)
+        apply_response_headers(&mut response, &rules);
+        apply_response_headers(&mut response, &rules);
+        apply_response_headers(&mut response, &rules);
+
+        let cc = response.headers().get("Cache-Control").unwrap().to_str().unwrap();
+
+        // Should only appear once, not three times
+        assert_eq!(cc, "public, max-age=3600");
+    }
+
+    #[test]
+    fn test_apply_merge_idempotent_complex() {
+        // Test idempotent merge with complex cache-control value
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let rules = HeaderRules {
+            merge: vec![(
+                "Cache-Control".to_string(),
+                "public, stale-while-revalidate=31536000, stale-if-error=31536000, max-age=7200, max-stale=86400".to_string()
+            )],
+            ..Default::default()
+        };
+
+        // Apply multiple times (simulating proxy loop with 10 iterations)
+        for _ in 0..10 {
+            apply_response_headers(&mut response, &rules);
+        }
+
+        let cc = response.headers().get("Cache-Control").unwrap().to_str().unwrap();
+
+        // Should still only be the original value, not duplicated
+        assert_eq!(cc, "public, stale-while-revalidate=31536000, stale-if-error=31536000, max-age=7200, max-stale=86400");
+    }
+
     // =====================================================================
     // apply_response_headers - combined rules tests
     // =====================================================================
@@ -784,13 +859,16 @@ mod tests {
         // assert!(rules.set_if_empty.iter().any(|(n, _)| n == "Access-Control-Allow-Origin"));
         assert!(rules.set_if_empty.iter().any(|(n, _)| n == "Referrer-Policy"));
 
+        // Cache-Control moved to set_if_empty to avoid duplication with upstream headers
+        assert!(rules.set_if_empty.iter().any(|(n, _)| n == "Cache-Control"));
+
         // Check unset headers
         assert!(rules.unset.contains(&"X-Powered-By".to_string()));
         assert!(rules.unset.contains(&"Via".to_string()));
         assert!(rules.unset.contains(&"x-varnish".to_string()));
 
-        // Check merge has Cache-Control
-        assert!(rules.merge.iter().any(|(n, _)| n == "Cache-Control"));
+        // Merge should be empty (Cache-Control moved to set_if_empty)
+        assert!(rules.merge.is_empty());
     }
 
     #[test]

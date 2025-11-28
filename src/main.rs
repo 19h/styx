@@ -54,6 +54,11 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Initialize TLS crypto provider (required for outbound HTTPS connections)
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Initialize logging
     init_logging(&args.log_level, args.json_logs)?;
 

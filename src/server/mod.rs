@@ -16,11 +16,13 @@ use crate::tls::TlsManager;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::{header, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use static_files::{serve_static, StaticFileConfig};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -77,8 +79,8 @@ pub struct Server {
     global_headers: HeaderRules,
     /// Connection limiter for DoS protection
     connection_semaphore: Arc<Semaphore>,
-    /// Per-IP rate limiting
-    ip_rate_limits: Arc<DashMap<IpAddr, Arc<IpRateLimit>>>,
+    /// Per-IP rate limiting (bounded LRU to prevent memory exhaustion)
+    ip_rate_limits: Arc<parking_lot::Mutex<LruCache<IpAddr, Arc<IpRateLimit>>>>,
     /// Maximum request body size
     #[allow(dead_code)]
     max_body_size: u64,
@@ -113,7 +115,10 @@ impl Server {
             stats: Arc::new(ServerStats::default()),
             global_headers,
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
-            ip_rate_limits: Arc::new(DashMap::new()),
+            // Bounded LRU cache: max 100k IPs to prevent memory exhaustion
+            ip_rate_limits: Arc::new(parking_lot::Mutex::new(
+                LruCache::new(NonZeroUsize::new(100_000).unwrap())
+            )),
         })
     }
 
@@ -123,11 +128,7 @@ impl Server {
 
         let mut handles = Vec::new();
 
-        // Start cleanup task for IP rate limit map to prevent unbounded growth
-        let server_for_cleanup = Arc::clone(&self);
-        handles.push(tokio::spawn(async move {
-            server_for_cleanup.cleanup_ip_rate_limits().await;
-        }));
+        // Note: LRU cache automatically evicts old entries, no cleanup task needed
 
         // Start listeners
         for listener_config in &self.config.listeners {
@@ -188,14 +189,14 @@ impl Server {
             let ip_addr = normalize_ip_for_rate_limiting(peer_addr.ip());
 
             let now = Instant::now();
-            let ip_limit = self.ip_rate_limits
-                .entry(ip_addr)
-                .or_insert_with(|| Arc::new(IpRateLimit {
+            let ip_limit = {
+                let mut cache = self.ip_rate_limits.lock();
+                cache.get_or_insert(ip_addr, || Arc::new(IpRateLimit {
                     connections: AtomicUsize::new(0),
                     last_request: parking_lot::Mutex::new(now),
                     created_at: now,
-                }))
-                .clone();
+                })).clone()
+            };
 
             let ip_conns = ip_limit.connections.fetch_add(1, Ordering::Relaxed);
             if ip_conns >= MAX_CONNECTIONS_PER_IP {
@@ -251,10 +252,8 @@ impl Server {
         let io = TokioIo::new(stream);
         let server = Arc::clone(&self);
 
-        // Add request timeout (30 seconds for header read)
         let mut builder = http1::Builder::new();
         builder.keep_alive(true);
-        builder.header_read_timeout(Duration::from_secs(30));
 
         // Serve connection with overall timeout (5 minutes max per connection)
         tokio::time::timeout(
@@ -271,7 +270,8 @@ impl Server {
                         )
                         .await
                         .unwrap_or_else(|_| {
-                            Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request timeout"))
+                            Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request timeout")
+                                .map(|body| body.map_err(|e| match e {}).boxed()))
                         })
                     }
                 }),
@@ -317,10 +317,8 @@ impl Server {
         let io = TokioIo::new(tls_stream);
         let server = Arc::clone(&self);
 
-        // Add request timeout (30 seconds for header read)
         let mut builder = http1::Builder::new();
         builder.keep_alive(true);
-        builder.header_read_timeout(Duration::from_secs(30));
 
         // Serve connection with overall timeout (5 minutes max per connection)
         tokio::time::timeout(
@@ -337,7 +335,8 @@ impl Server {
                         )
                         .await
                         .unwrap_or_else(|_| {
-                            Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request timeout"))
+                            Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request timeout")
+                                .map(|body| body.map_err(|e| match e {}).boxed()))
                         })
                     }
                 }),
@@ -348,12 +347,12 @@ impl Server {
         Ok(())
     }
 
-    /// Handle a single HTTP request
+    /// Handle a single HTTP request (streaming)
     async fn handle_request(
         self: Arc<Self>,
         request: Request<Incoming>,
         peer_addr: SocketAddr,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
         let host = request
@@ -371,7 +370,8 @@ impl Server {
             Some(r) => r,
             None => {
                 debug!("No route for {} {}", host, path);
-                return Ok(error_response(StatusCode::NOT_FOUND, "Not Found"));
+                let resp = error_response(StatusCode::NOT_FOUND, "Not Found");
+                return Ok(resp.map(|body| body.map_err(|e| match e {}).boxed()));
             }
         };
 
@@ -381,20 +381,21 @@ impl Server {
             Err(e) => {
                 warn!("Request error: {}", e);
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                error_response(StatusCode::BAD_GATEWAY, &format!("Proxy error: {}", e))
+                let resp = error_response(StatusCode::BAD_GATEWAY, &format!("Proxy error: {}", e));
+                resp.map(|body| body.map_err(|e| match e {}).boxed())
             }
         };
 
         Ok(response)
     }
 
-    /// Execute a route action
+    /// Execute a route action (streaming)
     async fn execute_action(
         &self,
         request: Request<Incoming>,
         route: &MatchResult,
         peer_addr: SocketAddr,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+    ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
         match &route.action {
             RouteAction::Redirect { url, status } => {
                 // Apply header rules to redirect response
@@ -402,7 +403,7 @@ impl Server {
                 let merged_headers = self.global_headers.merge_with(&route.headers);
                 apply_response_headers(&mut response, &merged_headers);
                 apply_expires(&mut response, route.expires);
-                Ok(response)
+                Ok(response.map(|body| body.map_err(|e| match e {}).boxed()))
             }
 
             RouteAction::Status => {
@@ -410,7 +411,7 @@ impl Server {
                 let merged_headers = self.global_headers.merge_with(&route.headers);
                 apply_response_headers(&mut response, &merged_headers);
                 apply_expires(&mut response, route.expires);
-                Ok(response)
+                Ok(response.map(|body| body.map_err(|e| match e {}).boxed()))
             }
 
             RouteAction::StaticFiles { dir, index, send_gzip, dirlisting } => {
@@ -427,12 +428,12 @@ impl Server {
                         let merged_headers = self.global_headers.merge_with(&route.headers);
                         apply_response_headers(&mut response, &merged_headers);
                         apply_expires(&mut response, route.expires);
-                        Ok(response)
+                        Ok(response.map(|body| body.map_err(|e| match e {}).boxed()))
                     }
                     Err(e) => {
                         let status = e.status_code();
                         let msg = e.to_string();
-                        Ok(error_response(status, &msg))
+                        Ok(error_response(status, &msg).map(|body| body.map_err(|e| match e {}).boxed()))
                     }
                 }
             }
@@ -440,7 +441,8 @@ impl Server {
             RouteAction::Proxy { upstream, preserve_host } => {
                 let merged_response_headers = self.global_headers.merge_with(&route.headers);
 
-                let response: Response<Incoming> = self
+                // Streaming proxy - no body buffering
+                let mut response: Response<Incoming> = self
                     .proxy
                     .proxy(
                         request,
@@ -452,42 +454,11 @@ impl Server {
                     )
                     .await?;
 
-                // Convert Incoming body to Full<Bytes> with size limit
-                let (parts, mut body) = response.into_parts();
-
-                // Add independent timeout for body collection (60 seconds)
-                // This prevents slowloris-style attacks on response body transfer
-                const BODY_COLLECTION_TIMEOUT: Duration = Duration::from_secs(60);
-                const MAX_RESPONSE_SIZE: u64 = 100 * 1024 * 1024;
-
-                let body_bytes = match tokio::time::timeout(
-                    BODY_COLLECTION_TIMEOUT,
-                    async {
-                        let mut buf = bytes::BytesMut::new();
-
-                        while let Some(frame) = body.frame().await {
-                            if let Ok(frame) = frame {
-                                if let Some(data) = frame.data_ref() {
-                                    let new_size = buf.len() + data.len();
-                                    if new_size as u64 > MAX_RESPONSE_SIZE {
-                                        return Err(ProxyError::Upstream("Response too large".to_string()));
-                                    }
-                                    buf.extend_from_slice(data);
-                                }
-                            }
-                        }
-
-                        Ok::<_, ProxyError>(buf.freeze())
-                    }
-                ).await {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err(ProxyError::Upstream("Response body collection timeout".to_string())),
-                };
-
-                let mut response = Response::from_parts(parts, Full::new(body_bytes));
+                // Apply expires header
                 apply_expires(&mut response, route.expires);
-                Ok(response)
+
+                // Box the body to unify types (streaming, no conversion)
+                Ok(response.map(|body| body.boxed()))
             }
         }
     }
@@ -497,26 +468,7 @@ impl Server {
         &self.stats
     }
 
-    /// Cleanup IP rate limit map to prevent unbounded growth
-    async fn cleanup_ip_rate_limits(&self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-        loop {
-            interval.tick().await;
-
-            let now = Instant::now();
-            const MAX_AGE: Duration = Duration::from_secs(300); // 5 minutes
-
-            // Remove stale entries
-            self.ip_rate_limits.retain(|_ip, limit| {
-                let age = now.duration_since(limit.created_at);
-                let active_conns = limit.connections.load(Ordering::Relaxed);
-
-                // Keep if: has active connections OR created within last 5 minutes
-                active_conns > 0 || age < MAX_AGE
-            });
-        }
-    }
+    // IP rate limit cleanup removed - LRU cache handles eviction automatically
 }
 
 #[cfg(test)]

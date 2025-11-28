@@ -453,10 +453,40 @@ impl HeaderRules {
 
     pub fn merge_with(&self, other: &HeaderRules) -> HeaderRules {
         let mut result = self.clone();
+
+        // For set, set_if_empty, and unset: simple extend is fine since they override/remove
         result.set.extend(other.set.iter().cloned());
         result.set_if_empty.extend(other.set_if_empty.iter().cloned());
-        result.merge.extend(other.merge.iter().cloned());
         result.unset.extend(other.unset.iter().cloned());
+
+        // For merge: deduplicate by header name to prevent cumulative merging
+        // If both self and other have a merge rule for the same header, combine them
+        use std::collections::HashMap;
+        let mut merge_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Collect all merge rules from self
+        for (name, value) in &result.merge {
+            merge_map.entry(name.clone())
+                .or_insert_with(Vec::new)
+                .push(value.clone());
+        }
+
+        // Add merge rules from other
+        for (name, value) in &other.merge {
+            merge_map.entry(name.clone())
+                .or_insert_with(Vec::new)
+                .push(value.clone());
+        }
+
+        // Flatten back to vec, combining values for same header with comma separator
+        result.merge = merge_map.into_iter()
+            .map(|(name, values)| {
+                // Join multiple values with comma-space separator
+                let combined_value = values.join(", ");
+                (name, combined_value)
+            })
+            .collect();
+
         result
     }
 }

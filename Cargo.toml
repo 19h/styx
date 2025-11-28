@@ -56,6 +56,7 @@ prometheus-client = "0.23"
 # Rate limiting / DoS protection
 governor = "0.8"
 nonzero_ext = "0.3"
+lru = "0.12"
 
 # Time
 chrono = "0.4"
