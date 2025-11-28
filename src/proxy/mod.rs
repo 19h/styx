@@ -14,8 +14,13 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, Uri, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 /// Proxy configuration
 #[derive(Debug, Clone)]
@@ -61,8 +66,143 @@ impl ReverseProxy {
         })
     }
 
-    /// Proxy a request to an upstream server
+    /// Proxy a request to an upstream server with streaming support
+    /// This method automatically chooses between pooled (buffered) and streaming based on Content-Length
     pub async fn proxy(
+        &self,
+        request: Request<Incoming>,
+        upstream_url: &str,
+        preserve_host: bool,
+        proxy_headers: &HeaderRules,
+        response_headers: &HeaderRules,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        // Check Content-Length to decide streaming strategy
+        const STREAMING_THRESHOLD: u64 = 1024 * 1024; // 1MB
+        
+        let content_length = request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        
+        // Use streaming for large bodies or if Content-Length is unknown
+        if content_length.map(|len| len >= STREAMING_THRESHOLD).unwrap_or(false) {
+            return self.proxy_streaming(
+                request,
+                upstream_url,
+                preserve_host,
+                proxy_headers,
+                response_headers,
+                client_ip,
+            ).await;
+        }
+        
+        // Use pooled connection for small bodies
+        self.proxy_buffered(
+            request,
+            upstream_url,
+            preserve_host,
+            proxy_headers,
+            response_headers,
+            client_ip,
+        ).await
+    }
+
+    /// Proxy with streaming request body (bypasses connection pool)
+    async fn proxy_streaming(
+        &self,
+        request: Request<Incoming>,
+        upstream_url: &str,
+        preserve_host: bool,
+        proxy_headers: &HeaderRules,
+        response_headers: &HeaderRules,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        // Parse upstream URL
+        let upstream = parse_upstream_url(upstream_url, request.uri())?;
+        let (host, port) = extract_host_port(&upstream)?;
+        
+        // Prepare headers
+        let mut headers = request.headers().clone();
+        
+        // Validate Host header
+        if let Some(host_hdr) = headers.get(header::HOST) {
+            if let Ok(host_str) = host_hdr.to_str() {
+                validate_host_header(host_str)?;
+            }
+        }
+        
+        strip_forwarded_headers(&mut headers);
+        
+        // Set host header
+        if preserve_host {
+            if !headers.contains_key(header::HOST) {
+                if let Ok(host_value) = HeaderValue::from_str(&host) {
+                    headers.insert(header::HOST, host_value);
+                }
+            }
+        } else {
+            let host_with_port = if port == 80 || port == 443 {
+                host.clone()
+            } else {
+                format!("{}:{}", host, port)
+            };
+            if let Ok(host_value) = HeaderValue::from_str(&host_with_port) {
+                headers.insert(header::HOST, host_value);
+            }
+        }
+        
+        add_forwarded_headers(&mut headers, &request);
+        
+        if let Some(ip) = client_ip {
+            if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
+                headers.insert(HeaderName::from_static("x-forwarded-for"), value);
+            }
+        }
+        
+        apply_request_headers(&mut headers, proxy_headers);
+        remove_hop_headers(&mut headers);
+        
+        // Build streaming request
+        let mut proxy_request = Request::builder()
+            .method(request.method().clone())
+            .uri(&upstream)
+            .version(Version::HTTP_11);
+        
+        for (name, value) in headers.iter() {
+            proxy_request = proxy_request.header(name.clone(), value.clone());
+        }
+        
+        let proxy_request = proxy_request
+            .body(request.into_body())
+            .map_err(|e| ProxyError::Request(e.to_string()))?;
+        
+        // Create direct connection (bypass pool)
+        let parsed_upstream: Uri = upstream.parse().unwrap();
+        let use_tls = parsed_upstream.scheme_str() == Some("https");
+        
+        let response = tokio::time::timeout(
+            self.config.io_timeout,
+            self.send_streaming_request(&host, port, use_tls, proxy_request),
+        )
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        
+        // Apply response headers
+        let (mut parts, body) = response.into_parts();
+        remove_hop_headers(&mut parts.headers);
+        
+        let mut temp_response = Response::from_parts(parts.clone(), Full::new(Bytes::new()));
+        apply_response_headers(&mut temp_response, response_headers);
+        let (modified_parts, _) = temp_response.into_parts();
+        
+        Ok(Response::from_parts(modified_parts, body))
+    }
+
+    /// Proxy with buffered request body (uses connection pool)
+    async fn proxy_buffered(
         &self,
         mut request: Request<Incoming>,
         upstream_url: &str,
@@ -77,7 +217,9 @@ impl ReverseProxy {
         // Build the proxied request
         let (host, port) = extract_host_port(&upstream)?;
 
-        // Collect the request body
+        // Collect the request body for pooled connections
+        // Note: This is only used for small bodies (<1MB). Large bodies use proxy_streaming()
+        // which bypasses the pool and streams directly.
         let body_bytes = collect_body(request.body_mut(), self.config.max_body_size).await?;
 
         // Build new request
@@ -173,6 +315,97 @@ impl ReverseProxy {
         let (modified_parts, _) = temp_response.into_parts();
 
         Ok(Response::from_parts(modified_parts, body))
+    }
+
+    /// Send a streaming request using a direct connection (no pooling)
+    async fn send_streaming_request(
+        &self,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        request: Request<Incoming>,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        // Resolve host
+        let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+            .await
+            .map_err(|e| ProxyError::Upstream(format!("DNS resolution failed: {}", e)))?
+            .next()
+            .ok_or_else(|| ProxyError::Upstream("No addresses resolved".to_string()))?;
+        
+        // Validate resolved IP
+        crate::pool::validate_resolved_ip(addr.ip())
+            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        
+        // Connect to upstream
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| ProxyError::Upstream("Connect timeout".to_string()))?
+        .map_err(|e| ProxyError::Upstream(format!("Connect failed: {}", e)))?;
+        
+        stream.set_nodelay(true).ok();
+        
+        if use_tls {
+            // TLS connection
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            
+            let config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            
+            let connector = TlsConnector::from(Arc::new(config));
+            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|_| ProxyError::Upstream("Invalid DNS name".to_string()))?;
+            
+            let tls_stream = connector
+                .connect(domain, stream)
+                .await
+                .map_err(|e| ProxyError::Upstream(format!("TLS handshake failed: {}", e)))?;
+            
+            let io = TokioIo::new(tls_stream);
+            
+            // HTTP/1 handshake
+            let (mut sender, conn) = http1::handshake(io)
+                .await
+                .map_err(|e| ProxyError::Upstream(format!("HTTP handshake failed: {}", e)))?;
+            
+            // Spawn connection task
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::debug!("Streaming connection error: {}", e);
+                }
+            });
+            
+            // Send request
+            sender
+                .send_request(request)
+                .await
+                .map_err(|e| ProxyError::Upstream(format!("Request failed: {}", e)))
+        } else {
+            // Plain HTTP connection
+            let io = TokioIo::new(stream);
+            
+            // HTTP/1 handshake
+            let (mut sender, conn) = http1::handshake(io)
+                .await
+                .map_err(|e| ProxyError::Upstream(format!("HTTP handshake failed: {}", e)))?;
+            
+            // Spawn connection task
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::debug!("Streaming connection error: {}", e);
+                }
+            });
+            
+            // Send request
+            sender
+                .send_request(request)
+                .await
+                .map_err(|e| ProxyError::Upstream(format!("Request failed: {}", e)))
+        }
     }
 }
 

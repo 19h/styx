@@ -9,12 +9,14 @@
 //! - Conditional requests (If-Modified-Since, ETag)
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use http::{header, Method, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::Frame;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 
 /// Configuration for static file serving
 #[derive(Debug, Clone)]
@@ -31,11 +33,11 @@ pub struct StaticFileConfig {
     pub prefix: String,
 }
 
-/// Serve a static file request
+/// Serve a static file request  
 pub async fn serve_static<B>(
     request: &Request<B>,
     config: &StaticFileConfig,
-) -> Result<Response<Full<Bytes>>, StaticFileError> {
+) -> Result<Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>, StaticFileError> {
     // Only allow GET and HEAD
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return Err(StaticFileError::MethodNotAllowed);
@@ -72,7 +74,7 @@ async fn serve_file<B>(
     request: &Request<B>,
     file_path: &Path,
     config: &StaticFileConfig,
-) -> Result<Response<Full<Bytes>>, StaticFileError> {
+) -> Result<Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>, StaticFileError> {
     let file_path = file_path.to_path_buf();
 
     // Check for gzip version if client accepts it
@@ -119,7 +121,7 @@ async fn serve_file<B>(
             if inm_str == etag_value || inm_str == "*" {
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
-                    .body(Full::new(Bytes::new()))
+                    .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
                     .unwrap());
             }
         }
@@ -132,7 +134,7 @@ async fn serve_file<B>(
             if ims_str.contains(&file_modified.to_string()) {
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
-                    .body(Full::new(Bytes::new()))
+                    .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
                     .unwrap());
             }
         }
@@ -143,27 +145,27 @@ async fn serve_file<B>(
         .first_or_octet_stream()
         .to_string();
 
-    // Read file content with size limit to prevent OOM
-    const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB max file size
-
+    // Create streaming body (no size limit needed - streaming prevents OOM)
     let body = if request.method() == Method::HEAD {
-        Bytes::new()
+        // HEAD requests have empty body
+        Full::new(Bytes::new()).map_err(|e| match e {}).boxed()
     } else {
-        // Check file size before loading
-        if metadata.len() > MAX_FILE_SIZE {
-            return Err(StaticFileError::FileTooLarge);
-        }
-
-        let mut file = File::open(&final_path)
+        // Stream file contents in chunks
+        let file = File::open(&final_path)
             .await
             .map_err(|e| StaticFileError::IoError(e.to_string()))?;
 
-        let mut contents = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut contents)
-            .await
-            .map_err(|e| StaticFileError::IoError(e.to_string()))?;
-
-        Bytes::from(contents)
+        // Use ReaderStream to stream file in chunks (default 8KB chunks)
+        let reader_stream = ReaderStream::new(file);
+        
+        // Convert to Frame stream for http_body_util
+        let frame_stream = reader_stream.map(|result| {
+            result
+                .map(|bytes| Frame::data(bytes))
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        });
+        
+        BodyExt::boxed(StreamBody::new(frame_stream))
     };
 
     // Build response
@@ -192,7 +194,7 @@ async fn serve_file<B>(
 
     response = response.header(header::ACCEPT_RANGES, "bytes");
 
-    Ok(response.body(Full::new(body)).unwrap())
+    Ok(response.body(body).unwrap())
 }
 
 /// Directory entry for listing
@@ -208,7 +210,7 @@ async fn generate_directory_listing<B>(
     request: &Request<B>,
     dir_path: &Path,
     request_path: &str,
-) -> Result<Response<Full<Bytes>>, StaticFileError> {
+) -> Result<Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>, StaticFileError> {
     let mut entries = Vec::new();
 
     let mut read_dir = tokio::fs::read_dir(dir_path)
@@ -259,16 +261,16 @@ async fn generate_directory_listing<B>(
     let html = render_directory_html(request_path, &entries, sort_by, sort_dir);
 
     let body = if request.method() == Method::HEAD {
-        Bytes::new()
+        Full::new(Bytes::new()).map_err(|e| match e {}).boxed()
     } else {
-        Bytes::from(html)
+        Full::new(Bytes::from(html)).map_err(|e| match e {}).boxed()
     };
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Full::new(body))
+        .body(body)
         .unwrap())
 }
 

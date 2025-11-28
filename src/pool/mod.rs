@@ -328,7 +328,7 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, PoolError> {
 }
 
 /// Validate resolved IP address to prevent DNS rebinding
-fn validate_resolved_ip(ip: std::net::IpAddr) -> Result<(), PoolError> {
+pub fn validate_resolved_ip(ip: std::net::IpAddr) -> Result<(), PoolError> {
     use std::net::{IpAddr, Ipv4Addr};
 
     match ip {
