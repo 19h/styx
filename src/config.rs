@@ -1001,11 +1001,9 @@ impl Config {
                             // Implementing per-listener TLS versions would require significant architectural changes
                             let _ = parse_tls_version(&ssl.minimum_version);
 
-                            // Capture SNI fallback setting from first SSL config found
+                            // Capture SNI fallback setting - enable if ANY SSL config enables it
                             // This is global across all TLS listeners
-                            if !sni_fallback {
-                                sni_fallback = ssl.sni_fallback.is_on();
-                            }
+                            sni_fallback = sni_fallback || ssl.sni_fallback.is_on();
 
                             Some(Arc::new(TlsListenerConfig {
                                 cert_path: ssl.certificate_file.clone(),

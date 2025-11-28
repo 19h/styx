@@ -170,9 +170,24 @@ impl Server {
 
         // Build TLS acceptor if needed
         let tls_acceptor = if let Some(tls_cfg) = &tls_config {
-            // Load certificate for this listener
-            self.tls_manager
-                .load_cert("*", &tls_cfg.cert_path, &tls_cfg.key_path)?;
+            // Load certificate for all hostnames that use this listener
+            // Find all hosts that listen on this address
+            for (host_name, _host_config) in &self.config.hosts {
+                // Parse hostname from "hostname:port" format
+                if let Some(colon_pos) = host_name.rfind(':') {
+                    let hostname = &host_name[..colon_pos];
+                    let port_str = &host_name[colon_pos + 1..];
+
+                    // Check if this host uses this listener's port
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        if addr.port() == port {
+                            // Load cert for this hostname
+                            self.tls_manager
+                                .load_cert(hostname, &tls_cfg.cert_path, &tls_cfg.key_path)?;
+                        }
+                    }
+                }
+            }
 
             // Use HTTP/1-only config if HTTP/2 is disabled
             let server_config = if self.config.http2.enabled {
