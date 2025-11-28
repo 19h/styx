@@ -72,6 +72,31 @@ impl BackendConfig {
     }
 }
 
+/// TLS configuration for TCP proxy
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TcpTlsConfig {
+    /// Path to certificate file (PEM format)
+    pub certificate_file: PathBuf,
+
+    /// Path to private key file (PEM format)
+    pub key_file: PathBuf,
+
+    /// Enable transparent TLS upgrade (auto-detect TLS vs plaintext on same port)
+    /// When enabled, the proxy peeks at incoming bytes to detect TLS ClientHello
+    /// and automatically upgrades the connection if detected. Default: off
+    #[serde(default)]
+    pub transparent_upgrade: OnOff,
+
+    /// Timeout for TLS handshake in milliseconds
+    #[serde(default = "default_tls_handshake_timeout")]
+    pub handshake_timeout: u64,
+}
+
+fn default_tls_handshake_timeout() -> u64 {
+    10000 // 10 seconds
+}
+
 /// Health check configuration for TCP backends
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -430,6 +455,10 @@ pub struct HostConfig {
     #[serde(default)]
     pub health: Option<HealthConfig>,
 
+    /// TLS configuration for TCP proxy (for TCP mode)
+    #[serde(default)]
+    pub tls: Option<TcpTlsConfig>,
+
     /// Host-level headers
     #[serde(default, rename = "header.set")]
     pub header_set: HeaderValue,
@@ -525,6 +554,17 @@ pub struct ResolvedTcpListener {
     pub addr: SocketAddr,
     pub backends: Vec<ResolvedBackend>,
     pub health: ResolvedHealthConfig,
+    pub tls: Option<ResolvedTcpTlsConfig>,
+}
+
+/// Resolved TLS configuration for TCP proxy
+#[derive(Debug, Clone)]
+pub struct ResolvedTcpTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    /// Enable transparent TLS upgrade (auto-detect TLS vs plaintext)
+    pub transparent_upgrade: bool,
+    pub handshake_timeout: Duration,
 }
 
 /// Resolved backend configuration
@@ -790,10 +830,18 @@ impl Config {
                                 .map(ResolvedHealthConfig::from)
                                 .unwrap_or_default();
 
+                            let tls = host_config.tls.as_ref().map(|tls_cfg| ResolvedTcpTlsConfig {
+                                cert_path: tls_cfg.certificate_file.clone(),
+                                key_path: tls_cfg.key_file.clone(),
+                                transparent_upgrade: tls_cfg.transparent_upgrade.is_on(),
+                                handshake_timeout: Duration::from_millis(tls_cfg.handshake_timeout),
+                            });
+
                             tcp_listeners.push(ResolvedTcpListener {
                                 addr,
                                 backends,
                                 health,
+                                tls,
                             });
                         }
                         continue; // Skip HTTP host processing for TCP listeners
@@ -2140,5 +2188,144 @@ hosts:
 
         // TCP listener without backends should be ignored
         assert!(resolved.tcp_listeners.is_empty());
+    }
+
+    // =====================================================================
+    // TCP TLS Configuration tests
+    // =====================================================================
+
+    #[test]
+    fn test_tcp_tls_config_parsing() {
+        let yaml = r#"
+certificate-file: /etc/ssl/certs/server.crt
+key-file: /etc/ssl/private/server.key
+transparent-upgrade: ON
+handshake-timeout: 15000
+"#;
+        let tls: TcpTlsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(tls.certificate_file.to_str().unwrap(), "/etc/ssl/certs/server.crt");
+        assert_eq!(tls.key_file.to_str().unwrap(), "/etc/ssl/private/server.key");
+        assert!(tls.transparent_upgrade.is_on());
+        assert_eq!(tls.handshake_timeout, 15000);
+    }
+
+    #[test]
+    fn test_tcp_tls_config_defaults() {
+        let yaml = r#"
+certificate-file: /etc/ssl/certs/server.crt
+key-file: /etc/ssl/private/server.key
+"#;
+        let tls: TcpTlsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!tls.transparent_upgrade.is_on()); // Default off
+        assert_eq!(tls.handshake_timeout, 10000); // Default 10 seconds
+    }
+
+    #[test]
+    fn test_tcp_proxy_with_tls_config() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4443":
+    listen:
+      host: 127.0.0.1
+      port: 4443
+      type: tcp
+    tls:
+      certificate-file: /etc/ssl/certs/server.crt
+      key-file: /etc/ssl/private/server.key
+      transparent-upgrade: ON
+      handshake-timeout: 5000
+    backends:
+      - host: 127.0.0.1
+        port: 8080
+        weight: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let host = config.hosts.get("127.0.0.1:4443").unwrap();
+
+        assert!(host.tls.is_some());
+        let tls = host.tls.as_ref().unwrap();
+        assert_eq!(tls.certificate_file.to_str().unwrap(), "/etc/ssl/certs/server.crt");
+        assert_eq!(tls.key_file.to_str().unwrap(), "/etc/ssl/private/server.key");
+        assert!(tls.transparent_upgrade.is_on());
+        assert_eq!(tls.handshake_timeout, 5000);
+    }
+
+    #[test]
+    fn test_tcp_proxy_tls_config_resolve() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4443":
+    listen:
+      host: 127.0.0.1
+      port: 4443
+      type: tcp
+    tls:
+      certificate-file: /etc/ssl/certs/server.crt
+      key-file: /etc/ssl/private/server.key
+      transparent-upgrade: ON
+      handshake-timeout: 5000
+    backends:
+      - host: 127.0.0.1
+        port: 8080
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve().unwrap();
+
+        assert_eq!(resolved.tcp_listeners.len(), 1);
+        let tcp_listener = &resolved.tcp_listeners[0];
+
+        assert!(tcp_listener.tls.is_some());
+        let tls = tcp_listener.tls.as_ref().unwrap();
+        assert_eq!(tls.cert_path.to_str().unwrap(), "/etc/ssl/certs/server.crt");
+        assert_eq!(tls.key_path.to_str().unwrap(), "/etc/ssl/private/server.key");
+        assert!(tls.transparent_upgrade);
+        assert_eq!(tls.handshake_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_tcp_proxy_without_tls() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4480":
+    listen:
+      host: 127.0.0.1
+      port: 4480
+      type: tcp
+    backends:
+      - host: 127.0.0.1
+        port: 8080
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve().unwrap();
+
+        assert_eq!(resolved.tcp_listeners.len(), 1);
+        let tcp_listener = &resolved.tcp_listeners[0];
+
+        // No TLS config
+        assert!(tcp_listener.tls.is_none());
+    }
+
+    #[test]
+    fn test_tcp_proxy_tls_only_mode() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4443":
+    listen:
+      host: 127.0.0.1
+      port: 4443
+      type: tcp
+    tls:
+      certificate-file: /etc/ssl/certs/server.crt
+      key-file: /etc/ssl/private/server.key
+      # transparent-upgrade not set, defaults to OFF
+    backends:
+      - host: 127.0.0.1
+        port: 8080
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve().unwrap();
+
+        let tls = resolved.tcp_listeners[0].tls.as_ref().unwrap();
+        assert!(!tls.transparent_upgrade); // Default is OFF (TLS only mode)
     }
 }

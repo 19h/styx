@@ -114,13 +114,19 @@ fn main() -> anyhow::Result<()> {
         // Start TCP proxies
         let mut tcp_handles = Vec::new();
         for tcp_listener in &resolved.tcp_listeners {
-            let tcp_proxy = tcp_proxy::TcpProxy::new(tcp_listener);
-            let handle = tokio::spawn(async move {
-                if let Err(e) = tcp_proxy.run().await {
-                    error!("TCP proxy failed: {}", e);
+            match tcp_proxy::TcpProxy::new(tcp_listener) {
+                Ok(tcp_proxy) => {
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = tcp_proxy.run().await {
+                            error!("TCP proxy failed: {}", e);
+                        }
+                    });
+                    tcp_handles.push(handle);
                 }
-            });
-            tcp_handles.push(handle);
+                Err(e) => {
+                    error!("Failed to create TCP proxy for {}: {}", tcp_listener.addr, e);
+                }
+            }
         }
 
         if !resolved.tcp_listeners.is_empty() {

@@ -1,19 +1,24 @@
-//! TCP proxy implementation with weighted load balancing and health checking
+//! TCP proxy implementation with weighted load balancing, health checking, and TLS support
 //!
 //! This module provides Layer 4 (TCP) proxying with:
 //! - Weighted random backend selection
 //! - Health checking with configurable thresholds
 //! - Latency-aware load balancing (optional)
+//! - TLS termination with transparent upgrade support
 //! - Bidirectional stream copying
 
-use crate::config::{ResolvedBackend, ResolvedHealthConfig, ResolvedTcpListener};
+use crate::config::{ResolvedBackend, ResolvedHealthConfig, ResolvedTcpListener, ResolvedTcpTlsConfig};
 use parking_lot::RwLock;
+use rustls_pemfile::{certs, private_key};
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, trace, warn};
 
 /// Statistics for a TCP proxy listener
@@ -29,6 +34,10 @@ pub struct TcpProxyStats {
     pub bytes_sent: AtomicU64,
     /// Bytes transferred (backend -> client)
     pub bytes_received: AtomicU64,
+    /// TLS connections
+    pub tls_connections: AtomicU64,
+    /// Plaintext connections (when transparent upgrade is enabled)
+    pub plaintext_connections: AtomicU64,
 }
 
 /// Backend state with health tracking
@@ -144,6 +153,56 @@ impl BackendState {
     }
 }
 
+/// Check if bytes look like a TLS ClientHello
+/// TLS record format: ContentType(1) | Version(2) | Length(2) | HandshakeType(1)
+/// ClientHello: ContentType=0x16 (Handshake), HandshakeType=0x01 (ClientHello)
+#[inline]
+fn looks_like_tls_client_hello(hdr: &[u8]) -> bool {
+    if hdr.len() < 6 {
+        return false;
+    }
+    // ContentType: 0x16 = Handshake
+    if hdr[0] != 0x16 {
+        return false;
+    }
+    // Version: 0x03 0x0X (TLS 1.0-1.3 all use 0x0301 in record layer)
+    if hdr[1] != 0x03 {
+        return false;
+    }
+    // Minor version: 0x00-0x04
+    if hdr[2] > 0x04 {
+        return false;
+    }
+    // Length sanity check (max 16KB for TLS record)
+    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+    if len == 0 || len > 16 * 1024 {
+        return false;
+    }
+    // HandshakeType: 0x01 = ClientHello
+    hdr[5] == 0x01
+}
+
+/// Load TLS server configuration from certificate and key files
+fn load_tls_config(tls_config: &ResolvedTcpTlsConfig) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    let cert_file = File::open(&tls_config.cert_path)?;
+    let key_file = File::open(&tls_config.key_path)?;
+
+    let mut cert_reader = BufReader::new(cert_file);
+    let mut key_reader = BufReader::new(key_file);
+
+    let certs: Vec<_> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let key = private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", tls_config.key_path.display()))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(Arc::new(config))
+}
+
 /// TCP proxy for a single listener
 pub struct TcpProxy {
     /// Listen address
@@ -152,6 +211,10 @@ pub struct TcpProxy {
     backends: Vec<Arc<BackendState>>,
     /// Health configuration
     health_config: ResolvedHealthConfig,
+    /// TLS configuration (optional)
+    tls_config: Option<ResolvedTcpTlsConfig>,
+    /// TLS acceptor (built from tls_config)
+    tls_acceptor: Option<TlsAcceptor>,
     /// Statistics
     stats: Arc<TcpProxyStats>,
     /// Total weight for selection (cached)
@@ -160,7 +223,7 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     /// Create a new TCP proxy from configuration
-    pub fn new(config: &ResolvedTcpListener) -> Arc<Self> {
+    pub fn new(config: &ResolvedTcpListener) -> anyhow::Result<Arc<Self>> {
         let backends: Vec<Arc<BackendState>> = config
             .backends
             .iter()
@@ -169,21 +232,39 @@ impl TcpProxy {
 
         let total_weight: u32 = backends.iter().map(|b| b.base_weight).sum();
 
-        Arc::new(Self {
+        // Build TLS acceptor if TLS is configured
+        let tls_acceptor = if let Some(ref tls_cfg) = config.tls {
+            let server_config = load_tls_config(tls_cfg)?;
+            Some(TlsAcceptor::from(server_config))
+        } else {
+            None
+        };
+
+        Ok(Arc::new(Self {
             addr: config.addr,
             backends,
             health_config: config.health.clone(),
+            tls_config: config.tls.clone(),
+            tls_acceptor,
             stats: Arc::new(TcpProxyStats::default()),
             total_weight: AtomicU32::new(total_weight),
-        })
+        }))
     }
 
     /// Run the TCP proxy
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
+
+        let tls_mode = match (&self.tls_acceptor, self.tls_config.as_ref().map(|c| c.transparent_upgrade)) {
+            (Some(_), Some(true)) => "TLS with transparent upgrade",
+            (Some(_), _) => "TLS only",
+            (None, _) => "plaintext",
+        };
+
         info!(
-            "TCP proxy listening on {} with {} backends",
+            "TCP proxy listening on {} ({}) with {} backends",
             self.addr,
+            tls_mode,
             self.backends.len()
         );
 
@@ -251,26 +332,106 @@ impl TcpProxy {
         healthy_backends.last().cloned()
     }
 
-    /// Handle a single TCP connection
+    /// Handle a single TCP connection with optional TLS
     async fn handle_connection(
         &self,
-        mut client: TcpStream,
+        stream: TcpStream,
         peer_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         self.stats.connections.fetch_add(1, Ordering::Relaxed);
         self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
 
-        let result = self.proxy_connection(&mut client, peer_addr).await;
+        let result = if let Some(ref acceptor) = self.tls_acceptor {
+            let transparent = self.tls_config.as_ref().map(|c| c.transparent_upgrade).unwrap_or(false);
+            let handshake_timeout = self.tls_config.as_ref()
+                .map(|c| c.handshake_timeout)
+                .unwrap_or(Duration::from_secs(10));
+
+            if transparent {
+                // Transparent upgrade: peek at first bytes to detect TLS
+                self.handle_transparent_connection(stream, peer_addr, acceptor, handshake_timeout).await
+            } else {
+                // TLS only mode
+                self.handle_tls_connection(stream, peer_addr, acceptor, handshake_timeout).await
+            }
+        } else {
+            // Plaintext mode
+            self.stats.plaintext_connections.fetch_add(1, Ordering::Relaxed);
+            self.proxy_stream(stream, peer_addr).await
+        };
 
         self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
         result
     }
 
-    async fn proxy_connection(
+    /// Handle connection with transparent TLS upgrade
+    async fn handle_transparent_connection(
         &self,
-        client: &mut TcpStream,
+        stream: TcpStream,
         peer_addr: SocketAddr,
+        acceptor: &TlsAcceptor,
+        handshake_timeout: Duration,
     ) -> anyhow::Result<()> {
+        // Wait for stream to be readable and peek at first bytes
+        let is_tls = match tokio::time::timeout(handshake_timeout, async {
+            stream.readable().await.ok();
+            let mut hdr = [0u8; 6];
+            match stream.peek(&mut hdr).await {
+                Ok(n) if n >= 6 => looks_like_tls_client_hello(&hdr),
+                Ok(_) => false,
+                Err(_) => false,
+            }
+        }).await {
+            Ok(v) => v,
+            Err(_) => {
+                debug!("{}: timeout while sniffing for TLS", peer_addr);
+                return Ok(());
+            }
+        };
+
+        if is_tls {
+            debug!("{}: detected TLS ClientHello, upgrading connection", peer_addr);
+            self.handle_tls_connection(stream, peer_addr, acceptor, handshake_timeout).await
+        } else {
+            debug!("{}: plaintext detected, proceeding without TLS", peer_addr);
+            self.stats.plaintext_connections.fetch_add(1, Ordering::Relaxed);
+            self.proxy_stream(stream, peer_addr).await
+        }
+    }
+
+    /// Handle TLS connection
+    async fn handle_tls_connection(
+        &self,
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+        acceptor: &TlsAcceptor,
+        handshake_timeout: Duration,
+    ) -> anyhow::Result<()> {
+        // Perform TLS handshake with timeout
+        let tls_stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+            Ok(Ok(s)) => {
+                self.stats.tls_connections.fetch_add(1, Ordering::Relaxed);
+                debug!("{}: TLS handshake completed", peer_addr);
+                s
+            }
+            Ok(Err(e)) => {
+                debug!("{}: TLS handshake failed: {}", peer_addr, e);
+                return Ok(());
+            }
+            Err(_) => {
+                debug!("{}: TLS handshake timeout", peer_addr);
+                return Ok(());
+            }
+        };
+
+        self.proxy_stream(tls_stream, peer_addr).await
+    }
+
+    /// Proxy a stream (either TLS or plaintext) to backend
+    async fn proxy_stream<S>(&self, mut stream: S, peer_addr: SocketAddr) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         // Select backend
         let backend = match self.select_backend() {
             Some(b) => b,
@@ -284,16 +445,14 @@ impl TcpProxy {
 
         // Connect to backend with timeout
         let start = Instant::now();
-        let backend_stream = match tokio::time::timeout(
+        let mut backend_stream = match tokio::time::timeout(
             self.health_config.connect_timeout,
             TcpStream::connect(backend.addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
+        ).await {
+            Ok(Ok(s)) => {
                 backend.record_latency(start.elapsed());
                 backend.mark_healthy(self.health_config.healthy_threshold);
-                stream
+                s
             }
             Ok(Err(e)) => {
                 backend.mark_unhealthy(self.health_config.unhealthy_threshold);
@@ -307,12 +466,11 @@ impl TcpProxy {
             }
         };
 
-        // Set TCP options
-        let _ = client.set_nodelay(true);
+        // Set TCP options on backend
         let _ = backend_stream.set_nodelay(true);
 
         // Bidirectional copy
-        let (bytes_sent, bytes_received) = self.copy_bidirectional(client, backend_stream).await?;
+        let (bytes_sent, bytes_received) = self.copy_bidirectional_generic(&mut stream, &mut backend_stream).await?;
 
         self.stats.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
         self.stats.bytes_received.fetch_add(bytes_received, Ordering::Relaxed);
@@ -320,16 +478,20 @@ impl TcpProxy {
         Ok(())
     }
 
-    /// Copy data bidirectionally between client and backend
-    async fn copy_bidirectional(
+    /// Copy data bidirectionally between any two async streams
+    async fn copy_bidirectional_generic<C, B>(
         &self,
-        client: &mut TcpStream,
-        mut backend: TcpStream,
-    ) -> anyhow::Result<(u64, u64)> {
-        let (mut client_read, mut client_write) = client.split();
-        let (mut backend_read, mut backend_write) = backend.split();
-
+        client: &mut C,
+        backend: &mut B,
+    ) -> anyhow::Result<(u64, u64)>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+        B: AsyncRead + AsyncWrite + Unpin,
+    {
         let io_timeout = self.health_config.io_timeout;
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut backend_read, mut backend_write) = tokio::io::split(backend);
 
         // Copy client -> backend
         let client_to_backend = async {
@@ -599,5 +761,40 @@ mod tests {
         // When marked healthy again, weight should be restored
         state.mark_healthy(1);
         assert_eq!(state.effective_weight.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn test_looks_like_tls_client_hello() {
+        // Valid TLS 1.2 ClientHello
+        let valid_tls = [0x16, 0x03, 0x01, 0x00, 0x2a, 0x01];
+        assert!(looks_like_tls_client_hello(&valid_tls));
+
+        // Valid TLS 1.3 ClientHello
+        let valid_tls13 = [0x16, 0x03, 0x03, 0x00, 0x50, 0x01];
+        assert!(looks_like_tls_client_hello(&valid_tls13));
+
+        // Not TLS - plaintext data
+        let plaintext = [0x00, 0x00, 0x00, 0x05, 0x01, 0xff];
+        assert!(!looks_like_tls_client_hello(&plaintext));
+
+        // Not TLS - wrong content type
+        let wrong_type = [0x17, 0x03, 0x01, 0x00, 0x2a, 0x01];
+        assert!(!looks_like_tls_client_hello(&wrong_type));
+
+        // Not TLS - wrong handshake type (not ClientHello)
+        let wrong_handshake = [0x16, 0x03, 0x01, 0x00, 0x2a, 0x02];
+        assert!(!looks_like_tls_client_hello(&wrong_handshake));
+
+        // Too short
+        let too_short = [0x16, 0x03, 0x01];
+        assert!(!looks_like_tls_client_hello(&too_short));
+
+        // Length too large
+        let length_too_large = [0x16, 0x03, 0x01, 0x50, 0x00, 0x01];
+        assert!(!looks_like_tls_client_hello(&length_too_large));
+
+        // Zero length
+        let zero_length = [0x16, 0x03, 0x01, 0x00, 0x00, 0x01];
+        assert!(!looks_like_tls_client_hello(&zero_length));
     }
 }
