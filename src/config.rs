@@ -1988,7 +1988,6 @@ key-file: /tls/key.pem
     #[test]
     fn test_ssl_config_full() {
         let yaml = r#"
-minimum-version: TLSv1.3
 cipher-preference: client
 cipher-suite: "TLS_AES_256_GCM_SHA384"
 dh-file: /tls/dhparams.pem
