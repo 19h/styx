@@ -1,0 +1,113 @@
+[package]
+name = "styx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "High-performance reverse proxy with h2o configuration compatibility"
+license = "MIT"
+authors = ["styx Authors"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full", "parking_lot"] }
+
+# HTTP server and client
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http = "1.4"
+http-body-util = "0.1"
+bytes = "1.9"
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2.2"
+webpki-roots = "0.26"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Routing and matching
+regex = "1.11"
+matchit = "0.8"
+
+# Utilities
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2.0"
+anyhow = "1.0"
+parking_lot = "0.12"
+dashmap = "6.1"
+arc-swap = "1.7"
+once_cell = "1.20"
+pin-project-lite = "0.2"
+futures-util = "0.3"
+smallvec = "1.13"
+ahash = "0.8"
+indexmap = { version = "2.7", features = ["serde"] }
+
+# Connection pooling
+deadpool = "0.12"
+
+# Metrics
+prometheus-client = "0.23"
+
+# Rate limiting / DoS protection
+governor = "0.8"
+nonzero_ext = "0.3"
+
+# Time
+chrono = "0.4"
+humantime = "2.1"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Mime types for static files
+mime_guess = "2.0"
+
+# Async compression
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
+
+# Tower for middleware
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["full"] }
+
+# HTTP/2 specific
+h2 = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.14"
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+wiremock = "0.6"
+test-log = { version = "0.2", features = ["trace"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[[bench]]
+name = "routing"
+harness = false
+
+[[bench]]
+name = "proxy"
+harness = false
+
+[[bench]]
+name = "config"
+harness = false
+
+[[bench]]
+name = "middleware"
+harness = false
