@@ -360,14 +360,9 @@ pub struct PathConfig {
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub num_threads: usize,
-    pub access_log: PathBuf,
-    pub error_log: PathBuf,
     pub pid_file: Option<PathBuf>,
     pub limit_request_body: u64,
-    pub http2_idle_timeout: Duration,
     pub proxy_timeout_io: Duration,
-    pub proxy_timeout_keepalive: Duration,
-    pub file_send_gzip: bool,
     pub global_headers: HeaderRules,
     pub listeners: Vec<ResolvedListener>,
     pub hosts: HashMap<String, Arc<ResolvedHost>>,
@@ -385,13 +380,11 @@ pub struct ResolvedListener {
 pub struct TlsListenerConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-    pub min_version: rustls::ProtocolVersion,
 }
 
 /// Resolved host configuration
 #[derive(Debug, Clone)]
 pub struct ResolvedHost {
-    pub name: String,
     pub routes: Vec<ResolvedRoute>,
     pub headers: HeaderRules,
 }
@@ -568,7 +561,7 @@ impl Config {
 
         for (host_name, host_config) in &self.hosts {
             // Parse host:port from name
-            let (hostname, _port) = parse_host_port(host_name)?;
+            let (_hostname, _port) = parse_host_port(host_name)?;
 
             // Resolve listen config
             if let Some(listen_value) = &host_config.listen {
@@ -577,10 +570,13 @@ impl Config {
                     if !seen_addrs.contains(&addr) {
                         seen_addrs.insert(addr);
                         let tls_config = if let Some(ssl) = &listen_config.ssl {
+                            // Note: We currently ignore minimum_version as TlsManager uses a shared resolver
+                            // Implementing per-listener TLS versions would require significant architectural changes
+                            let _ = parse_tls_version(&ssl.minimum_version);
+
                             Some(Arc::new(TlsListenerConfig {
                                 cert_path: ssl.certificate_file.clone(),
                                 key_path: ssl.key_file.clone(),
-                                min_version: parse_tls_version(&ssl.minimum_version),
                             }))
                         } else {
                             None
@@ -662,7 +658,6 @@ impl Config {
             }
 
             let resolved_host = Arc::new(ResolvedHost {
-                name: hostname.clone(),
                 routes,
                 headers: host_headers,
             });
@@ -680,14 +675,9 @@ impl Config {
 
         Ok(ResolvedConfig {
             num_threads: self.num_threads,
-            access_log: self.access_log.clone(),
-            error_log: self.error_log.clone(),
             pid_file: self.pid_file.clone(),
             limit_request_body: self.limit_request_body,
-            http2_idle_timeout: Duration::from_secs(self.http2_idle_timeout),
             proxy_timeout_io: Duration::from_millis(self.proxy_timeout_io),
-            proxy_timeout_keepalive: Duration::from_millis(self.proxy_timeout_keepalive),
-            file_send_gzip: self.file_send_gzip.is_on(),
             global_headers,
             listeners,
             hosts,
@@ -1483,7 +1473,6 @@ hosts:
         let tls = listener.tls_config.as_ref().unwrap();
         assert_eq!(tls.cert_path, PathBuf::from("/tls/cert.pem"));
         assert_eq!(tls.key_path, PathBuf::from("/tls/key.pem"));
-        assert_eq!(tls.min_version, rustls::ProtocolVersion::TLSv1_2);
     }
 
     #[test]
@@ -1527,16 +1516,12 @@ hosts:
     fn test_resolve_durations() {
         let yaml = r#"
 proxy.timeout.io: 30000
-proxy.timeout.keepalive: 60000
-http2-idle-timeout: 120
 hosts: {}
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let resolved = config.resolve().unwrap();
 
         assert_eq!(resolved.proxy_timeout_io, Duration::from_millis(30000));
-        assert_eq!(resolved.proxy_timeout_keepalive, Duration::from_millis(60000));
-        assert_eq!(resolved.http2_idle_timeout, Duration::from_secs(120));
     }
 
     // =====================================================================

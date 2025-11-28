@@ -709,9 +709,6 @@ pub enum StaticFileError {
     #[error("method not allowed")]
     MethodNotAllowed,
 
-    #[error("file too large")]
-    FileTooLarge,
-
     #[error("IO error: {0}")]
     IoError(String),
 }
@@ -722,7 +719,6 @@ impl StaticFileError {
             StaticFileError::NotFound => StatusCode::NOT_FOUND,
             StaticFileError::Forbidden => StatusCode::FORBIDDEN,
             StaticFileError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            StaticFileError::FileTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             StaticFileError::IoError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

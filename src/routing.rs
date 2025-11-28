@@ -21,8 +21,6 @@ pub struct RouteMatcher {
 struct RouteEntry {
     /// Path pattern (may be prefix)
     path: String,
-    /// Whether this is an exact match
-    exact: bool,
     /// Action to take
     action: RouteAction,
     /// Header rules
@@ -41,7 +39,6 @@ impl RouteMatcher {
             .iter()
             .map(|r| RouteEntry {
                 path: r.path.clone(),
-                exact: !r.path.ends_with('/') && r.path != "/",
                 action: r.action.clone(),
                 headers: r.headers.clone(),
                 proxy_headers: r.proxy_headers.clone(),
@@ -195,11 +192,6 @@ impl Router {
 
         None
     }
-
-    /// Get all registered hosts
-    pub fn hosts(&self) -> impl Iterator<Item = &String> {
-        self.hosts.keys()
-    }
 }
 
 #[cfg(test)]
@@ -209,7 +201,6 @@ mod tests {
 
     fn make_test_host() -> ResolvedHost {
         ResolvedHost {
-            name: "test.example.com".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -282,7 +273,6 @@ mod tests {
     #[test]
     fn test_longest_prefix_wins() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -338,7 +328,6 @@ mod tests {
     #[test]
     fn test_path_match_with_trailing_slash() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/api".to_string(),
@@ -363,7 +352,6 @@ mod tests {
     fn test_trailing_slash_pattern_matches_subpaths() {
         // Pattern WITH trailing slash should match all subpaths
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -418,7 +406,6 @@ mod tests {
     fn test_path_no_false_prefix_match() {
         // /api should NOT match /apikey
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/api".to_string(),
@@ -441,7 +428,6 @@ mod tests {
     #[test]
     fn test_root_path_matches_everything() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -464,7 +450,6 @@ mod tests {
     #[test]
     fn test_empty_host_no_routes() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![],
             headers: HeaderRules::default(),
         };
@@ -478,7 +463,6 @@ mod tests {
     #[test]
     fn test_deep_nested_routes() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -532,7 +516,6 @@ mod tests {
     #[test]
     fn test_similar_prefixes() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/app".to_string(),
@@ -576,7 +559,6 @@ mod tests {
     #[test]
     fn test_query_string_not_part_of_path() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/api".to_string(),
@@ -599,7 +581,6 @@ mod tests {
     #[test]
     fn test_special_characters_in_path() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/wiki".to_string(),
@@ -640,7 +621,6 @@ mod tests {
         };
 
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -670,7 +650,6 @@ mod tests {
         };
 
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/".to_string(),
@@ -700,7 +679,6 @@ mod tests {
     #[test]
     fn test_redirect_action() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/old".to_string(),
@@ -731,7 +709,6 @@ mod tests {
     #[test]
     fn test_status_action() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/health".to_string(),
@@ -753,7 +730,6 @@ mod tests {
     #[test]
     fn test_static_files_action() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/static".to_string(),
@@ -787,7 +763,6 @@ mod tests {
     #[test]
     fn test_proxy_action() {
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 ResolvedRoute {
                     path: "/api".to_string(),
@@ -825,7 +800,6 @@ mod tests {
         hosts.insert(
             "example.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -851,7 +825,6 @@ mod tests {
         hosts.insert(
             "example.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -878,7 +851,6 @@ mod tests {
         hosts.insert(
             "example.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -904,7 +876,6 @@ mod tests {
         hosts.insert(
             "example.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -923,7 +894,6 @@ mod tests {
         hosts.insert(
             "other.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -956,39 +926,11 @@ mod tests {
     }
 
     #[test]
-    fn test_router_hosts_iterator() {
-        let mut hosts = std::collections::HashMap::new();
-        hosts.insert(
-            "a.com:80".to_string(),
-            Arc::new(ResolvedHost {
-                name: "test".to_string(),
-                routes: vec![],
-                headers: HeaderRules::default(),
-            }),
-        );
-        hosts.insert(
-            "b.com:80".to_string(),
-            Arc::new(ResolvedHost {
-                name: "test".to_string(),
-                routes: vec![],
-                headers: HeaderRules::default(),
-            }),
-        );
-
-        let router = Router::new(&hosts);
-        let registered_hosts: Vec<_> = router.hosts().collect();
-
-        // Should have original hosts plus hostname-only versions
-        assert!(registered_hosts.len() >= 2);
-    }
-
-    #[test]
     fn test_router_subdomain_routing() {
         let mut hosts = std::collections::HashMap::new();
         hosts.insert(
             "api.example.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -1007,7 +949,6 @@ mod tests {
         hosts.insert(
             "www.example.com:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -1047,7 +988,6 @@ mod tests {
     fn test_route_priority_order_preserved() {
         // Routes should be sorted by length, so longer paths match first
         let host = ResolvedHost {
-            name: "test".to_string(),
             routes: vec![
                 // Insert in wrong order - shorter first
                 ResolvedRoute {
@@ -1087,7 +1027,6 @@ mod tests {
         hosts.insert(
             "abc123.onion:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -1103,7 +1042,6 @@ mod tests {
         hosts.insert(
             "site.i2p:80".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),
@@ -1129,7 +1067,6 @@ mod tests {
         hosts.insert(
             "192.168.1.1:8080".to_string(),
             Arc::new(ResolvedHost {
-                name: "test".to_string(),
                 routes: vec![
                     ResolvedRoute {
                         path: "/".to_string(),

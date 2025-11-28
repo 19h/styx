@@ -126,18 +126,6 @@ impl TlsManager {
         Ok(())
     }
 
-    /// Set the default certificate
-    pub fn set_default_cert<P: AsRef<Path>>(
-        &self,
-        cert_path: P,
-        key_path: P,
-    ) -> anyhow::Result<()> {
-        let certified_key = load_certified_key(cert_path.as_ref(), key_path.as_ref())?;
-        self.resolver.set_default(Arc::new(certified_key));
-        info!("Set default TLS certificate");
-        Ok(())
-    }
-
     /// Build the server configuration
     pub fn build_server_config(&self) -> anyhow::Result<Arc<ServerConfig>> {
         let config = ServerConfig::builder()
@@ -145,16 +133,6 @@ impl TlsManager {
             .with_cert_resolver(self.resolver.clone());
 
         Ok(Arc::new(config))
-    }
-
-    /// Get the certificate resolver
-    pub fn resolver(&self) -> Arc<SniResolver> {
-        self.resolver.clone()
-    }
-
-    /// Get statistics
-    pub fn stats(&self) -> &TlsStats {
-        &self.stats
     }
 
     /// Record a handshake start
@@ -226,27 +204,6 @@ fn load_private_key<R: std::io::BufRead>(reader: &mut R) -> anyhow::Result<Priva
     anyhow::bail!("No private key found")
 }
 
-/// TLS DoS protection configuration
-#[derive(Debug, Clone)]
-pub struct TlsProtection {
-    /// Maximum handshakes per second per IP
-    pub max_handshakes_per_sec: u32,
-    /// Handshake timeout
-    pub handshake_timeout: std::time::Duration,
-    /// Maximum concurrent handshakes
-    pub max_concurrent_handshakes: usize,
-}
-
-impl Default for TlsProtection {
-    fn default() -> Self {
-        Self {
-            max_handshakes_per_sec: 100,
-            handshake_timeout: std::time::Duration::from_secs(10),
-            max_concurrent_handshakes: 1000,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,15 +252,6 @@ mod tests {
         assert_eq!(manager.stats.handshakes_started.load(Ordering::Relaxed), 1000);
     }
 
-    #[test]
-    fn test_tls_manager_resolver() {
-        let manager = TlsManager::new();
-        let resolver = manager.resolver();
-
-        // Resolver should be empty initially
-        assert_eq!(resolver.certs.len(), 0);
-    }
-
     // =====================================================================
     // SniResolver tests
     // =====================================================================
@@ -347,53 +295,6 @@ mod tests {
         assert_eq!(stats.handshakes_started.load(Ordering::Relaxed), 10);
         assert_eq!(stats.handshakes_completed.load(Ordering::Relaxed), 8);
         assert_eq!(stats.handshakes_failed.load(Ordering::Relaxed), 2);
-    }
-
-    // =====================================================================
-    // TlsProtection tests
-    // =====================================================================
-
-    #[test]
-    fn test_tls_protection_default() {
-        let protection = TlsProtection::default();
-
-        assert_eq!(protection.max_handshakes_per_sec, 100);
-        assert_eq!(protection.handshake_timeout, std::time::Duration::from_secs(10));
-        assert_eq!(protection.max_concurrent_handshakes, 1000);
-    }
-
-    #[test]
-    fn test_tls_protection_custom() {
-        let protection = TlsProtection {
-            max_handshakes_per_sec: 50,
-            handshake_timeout: std::time::Duration::from_secs(5),
-            max_concurrent_handshakes: 500,
-        };
-
-        assert_eq!(protection.max_handshakes_per_sec, 50);
-        assert_eq!(protection.handshake_timeout, std::time::Duration::from_secs(5));
-        assert_eq!(protection.max_concurrent_handshakes, 500);
-    }
-
-    #[test]
-    fn test_tls_protection_clone() {
-        let protection = TlsProtection::default();
-        let cloned = protection.clone();
-
-        assert_eq!(protection.max_handshakes_per_sec, cloned.max_handshakes_per_sec);
-        assert_eq!(protection.handshake_timeout, cloned.handshake_timeout);
-        assert_eq!(protection.max_concurrent_handshakes, cloned.max_concurrent_handshakes);
-    }
-
-    #[test]
-    fn test_tls_protection_debug() {
-        let protection = TlsProtection::default();
-        let debug_str = format!("{:?}", protection);
-
-        assert!(debug_str.contains("TlsProtection"));
-        assert!(debug_str.contains("max_handshakes_per_sec"));
-        assert!(debug_str.contains("handshake_timeout"));
-        assert!(debug_str.contains("max_concurrent_handshakes"));
     }
 
     // =====================================================================

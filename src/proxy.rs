@@ -27,8 +27,6 @@ use tokio_rustls::TlsConnector;
 pub struct ProxyConfig {
     /// I/O timeout
     pub io_timeout: Duration,
-    /// Keepalive timeout
-    pub keepalive_timeout: Duration,
     /// Maximum request body size
     pub max_body_size: u64,
 }
@@ -37,7 +35,6 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             io_timeout: Duration::from_secs(30),
-            keepalive_timeout: Duration::from_secs(30), // Reduced for security
             max_body_size: 10 * 1024 * 1024, // 10MB - secure default
         }
     }
@@ -57,7 +54,6 @@ impl ReverseProxy {
             idle_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(10),
             max_idle_per_host: 64,
-            keepalive_timeout: config.keepalive_timeout,
         };
 
         Arc::new(Self {
@@ -1043,7 +1039,6 @@ mod tests {
 
         // Reduced timeouts and body size for security
         assert_eq!(config.io_timeout, Duration::from_millis(30000));
-        assert_eq!(config.keepalive_timeout, Duration::from_millis(30000));
         assert_eq!(config.max_body_size, 10 * 1024 * 1024);  // 10MB
     }
 
@@ -1051,12 +1046,10 @@ mod tests {
     fn test_proxy_config_custom() {
         let config = ProxyConfig {
             io_timeout: Duration::from_secs(30),
-            keepalive_timeout: Duration::from_secs(60),
             max_body_size: 1024 * 1024 * 100, // 100MB
         };
 
         assert_eq!(config.io_timeout, Duration::from_secs(30));
-        assert_eq!(config.keepalive_timeout, Duration::from_secs(60));
         assert_eq!(config.max_body_size, 104857600);
     }
 

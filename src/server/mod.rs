@@ -27,7 +27,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -47,8 +47,6 @@ pub struct ServerStats {
 /// Per-IP rate limiting state
 struct IpRateLimit {
     connections: AtomicUsize,
-    last_request: parking_lot::Mutex<Instant>,
-    created_at: Instant,
 }
 
 /// Normalize IP address for rate limiting
@@ -92,7 +90,6 @@ impl Server {
 
         let proxy_config = ProxyConfig {
             io_timeout: config.proxy_timeout_io,
-            keepalive_timeout: config.proxy_timeout_keepalive,
             max_body_size: config.limit_request_body,
         };
         let proxy = ReverseProxy::new(proxy_config);
@@ -187,13 +184,10 @@ impl Server {
             const MAX_CONNECTIONS_PER_IP: usize = 100;
             let ip_addr = normalize_ip_for_rate_limiting(peer_addr.ip());
 
-            let now = Instant::now();
             let ip_limit = {
                 let mut cache = self.ip_rate_limits.lock();
                 cache.get_or_insert(ip_addr, || Arc::new(IpRateLimit {
                     connections: AtomicUsize::new(0),
-                    last_request: parking_lot::Mutex::new(now),
-                    created_at: now,
                 })).clone()
             };
 
@@ -484,12 +478,6 @@ impl Server {
         }
     }
 
-    /// Get server statistics
-    pub fn stats(&self) -> &ServerStats {
-        &self.stats
-    }
-
-    // IP rate limit cleanup removed - LRU cache handles eviction automatically
 }
 
 #[cfg(test)]

@@ -82,6 +82,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Write PID file if configured
+    if let Some(pid_path) = &resolved.pid_file {
+        let pid = std::process::id();
+        if let Err(e) = std::fs::write(pid_path, pid.to_string()) {
+            error!("Failed to write PID file to {:?}: {}", pid_path, e);
+            // Don't crash, just log error
+        } else {
+            info!("Wrote PID {} to {:?}", pid, pid_path);
+        }
+    }
+
     // Determine worker threads
     let workers = if args.workers == 0 {
         resolved.num_threads

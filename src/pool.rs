@@ -33,8 +33,6 @@ pub struct PoolConfig {
     pub connect_timeout: Duration,
     /// Maximum idle connections per host
     pub max_idle_per_host: usize,
-    /// Keepalive timeout
-    pub keepalive_timeout: Duration,
 }
 
 impl Default for PoolConfig {
@@ -44,7 +42,6 @@ impl Default for PoolConfig {
             idle_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(10),
             max_idle_per_host: 32,
-            keepalive_timeout: Duration::from_secs(59),
         }
     }
 }
@@ -493,7 +490,6 @@ mod tests {
         assert_eq!(config.idle_timeout, Duration::from_secs(90));
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert_eq!(config.max_idle_per_host, 32);
-        assert_eq!(config.keepalive_timeout, Duration::from_secs(59));
     }
 
     #[test]
@@ -503,14 +499,12 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(5),
             max_idle_per_host: 16,
-            keepalive_timeout: Duration::from_secs(30),
         };
 
         assert_eq!(config.max_connections_per_host, 128);
         assert_eq!(config.idle_timeout, Duration::from_secs(60));
         assert_eq!(config.connect_timeout, Duration::from_secs(5));
         assert_eq!(config.max_idle_per_host, 16);
-        assert_eq!(config.keepalive_timeout, Duration::from_secs(30));
     }
 
     // =====================================================================
@@ -530,7 +524,6 @@ mod tests {
             idle_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(5),
             max_idle_per_host: 8,
-            keepalive_timeout: Duration::from_secs(15),
         };
 
         let pool = ConnectionPool::new(config.clone());
@@ -700,7 +693,6 @@ mod tests {
             idle_timeout: Duration::from_secs(45),
             connect_timeout: Duration::from_secs(15),
             max_idle_per_host: 20,
-            keepalive_timeout: Duration::from_secs(30),
         };
 
         let cloned = config.clone();
@@ -709,7 +701,6 @@ mod tests {
         assert_eq!(config.idle_timeout, cloned.idle_timeout);
         assert_eq!(config.connect_timeout, cloned.connect_timeout);
         assert_eq!(config.max_idle_per_host, cloned.max_idle_per_host);
-        assert_eq!(config.keepalive_timeout, cloned.keepalive_timeout);
     }
 
     #[test]
