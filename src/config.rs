@@ -11,6 +11,144 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
+/// Listener type (HTTP or TCP)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListenerType {
+    #[default]
+    Http,
+    Tcp,
+}
+
+impl<'de> Deserialize<'de> for ListenerType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "http" | "https" => Ok(ListenerType::Http),
+            "tcp" => Ok(ListenerType::Tcp),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid listener type: {} (expected 'http' or 'tcp')",
+                s
+            ))),
+        }
+    }
+}
+
+impl Serialize for ListenerType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ListenerType::Http => serializer.serialize_str("http"),
+            ListenerType::Tcp => serializer.serialize_str("tcp"),
+        }
+    }
+}
+
+/// Backend server configuration for TCP proxy
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BackendConfig {
+    /// Backend host
+    pub host: String,
+    /// Backend port
+    pub port: u16,
+    /// Weight for load balancing (higher = more traffic)
+    #[serde(default = "default_backend_weight")]
+    pub weight: u32,
+}
+
+fn default_backend_weight() -> u32 {
+    100
+}
+
+impl BackendConfig {
+    pub fn socket_addr(&self) -> SocketAddr {
+        format!("{}:{}", self.host, self.port)
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], self.port)))
+    }
+}
+
+/// Health check configuration for TCP backends
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HealthConfig {
+    /// Interval between health checks in milliseconds
+    #[serde(default = "default_health_interval")]
+    pub interval: u64,
+
+    /// Timeout for health check connection in milliseconds
+    #[serde(default = "default_health_timeout")]
+    pub timeout: u64,
+
+    /// Number of consecutive failures before marking backend as unhealthy
+    #[serde(default = "default_health_threshold")]
+    pub unhealthy_threshold: u32,
+
+    /// Number of consecutive successes before marking backend as healthy
+    #[serde(default = "default_health_threshold")]
+    pub healthy_threshold: u32,
+
+    /// Connect timeout for proxied connections in milliseconds
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
+
+    /// I/O timeout for proxied connections in milliseconds
+    #[serde(default = "default_io_timeout")]
+    pub io_timeout: u64,
+
+    /// Latency sigma threshold for redistribution (standard deviations above mean)
+    /// Backends with latency > mean + (sigma * sigma_threshold) get reduced traffic
+    #[serde(default = "default_sigma_threshold")]
+    pub sigma_threshold: f64,
+
+    /// Enable latency-based load balancing
+    #[serde(default)]
+    pub latency_aware: OnOff,
+}
+
+fn default_health_interval() -> u64 {
+    5000 // 5 seconds
+}
+
+fn default_health_timeout() -> u64 {
+    2000 // 2 seconds
+}
+
+fn default_health_threshold() -> u32 {
+    3
+}
+
+fn default_connect_timeout() -> u64 {
+    5000 // 5 seconds
+}
+
+fn default_io_timeout() -> u64 {
+    30000 // 30 seconds
+}
+
+fn default_sigma_threshold() -> f64 {
+    2.0 // 2 standard deviations
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            interval: default_health_interval(),
+            timeout: default_health_timeout(),
+            unhealthy_threshold: default_health_threshold(),
+            healthy_threshold: default_health_threshold(),
+            connect_timeout: default_connect_timeout(),
+            io_timeout: default_io_timeout(),
+            sigma_threshold: default_sigma_threshold(),
+            latency_aware: OnOff::Off,
+        }
+    }
+}
+
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -222,6 +360,9 @@ pub struct ListenConfig {
     #[serde(default = "default_host")]
     pub host: String,
     pub port: u16,
+    /// Listener type: http (default) or tcp
+    #[serde(default, rename = "type")]
+    pub listener_type: ListenerType,
     #[serde(default)]
     pub ssl: Option<SslConfig>,
 }
@@ -277,9 +418,17 @@ pub struct HostConfig {
     #[serde(default)]
     pub listen: Option<serde_yaml::Value>,
 
-    /// Path configurations
+    /// Path configurations (for HTTP mode)
     #[serde(default)]
     pub paths: IndexMap<String, PathConfig>,
+
+    /// Backend servers (for TCP mode)
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+
+    /// Health check configuration (for TCP mode)
+    #[serde(default)]
+    pub health: Option<HealthConfig>,
 
     /// Host-level headers
     #[serde(default, rename = "header.set")]
@@ -366,6 +515,57 @@ pub struct ResolvedConfig {
     pub global_headers: HeaderRules,
     pub listeners: Vec<ResolvedListener>,
     pub hosts: HashMap<String, Arc<ResolvedHost>>,
+    /// TCP proxy listeners
+    pub tcp_listeners: Vec<ResolvedTcpListener>,
+}
+
+/// Resolved TCP listener configuration
+#[derive(Debug, Clone)]
+pub struct ResolvedTcpListener {
+    pub addr: SocketAddr,
+    pub backends: Vec<ResolvedBackend>,
+    pub health: ResolvedHealthConfig,
+}
+
+/// Resolved backend configuration
+#[derive(Debug, Clone)]
+pub struct ResolvedBackend {
+    pub addr: SocketAddr,
+    pub weight: u32,
+}
+
+/// Resolved health check configuration
+#[derive(Debug, Clone)]
+pub struct ResolvedHealthConfig {
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub unhealthy_threshold: u32,
+    pub healthy_threshold: u32,
+    pub connect_timeout: Duration,
+    pub io_timeout: Duration,
+    pub sigma_threshold: f64,
+    pub latency_aware: bool,
+}
+
+impl From<&HealthConfig> for ResolvedHealthConfig {
+    fn from(config: &HealthConfig) -> Self {
+        Self {
+            interval: Duration::from_millis(config.interval),
+            timeout: Duration::from_millis(config.timeout),
+            unhealthy_threshold: config.unhealthy_threshold,
+            healthy_threshold: config.healthy_threshold,
+            connect_timeout: Duration::from_millis(config.connect_timeout),
+            io_timeout: Duration::from_millis(config.io_timeout),
+            sigma_threshold: config.sigma_threshold,
+            latency_aware: config.latency_aware.is_on(),
+        }
+    }
+}
+
+impl Default for ResolvedHealthConfig {
+    fn default() -> Self {
+        Self::from(&HealthConfig::default())
+    }
 }
 
 /// Resolved listener configuration
@@ -557,7 +757,9 @@ impl Config {
 
         let mut hosts = HashMap::new();
         let mut listeners = Vec::new();
+        let mut tcp_listeners = Vec::new();
         let mut seen_addrs = std::collections::HashSet::new();
+        let mut seen_tcp_addrs = std::collections::HashSet::new();
 
         for (host_name, host_config) in &self.hosts {
             // Parse host:port from name
@@ -567,6 +769,37 @@ impl Config {
             if let Some(listen_value) = &host_config.listen {
                 if let Ok(listen_config) = serde_yaml::from_value::<ListenConfig>(listen_value.clone()) {
                     let addr = listen_config.socket_addr();
+
+                    // Handle TCP listeners separately
+                    if listen_config.listener_type == ListenerType::Tcp {
+                        if !seen_tcp_addrs.contains(&addr) && !host_config.backends.is_empty() {
+                            seen_tcp_addrs.insert(addr);
+
+                            let backends: Vec<ResolvedBackend> = host_config
+                                .backends
+                                .iter()
+                                .map(|b| ResolvedBackend {
+                                    addr: b.socket_addr(),
+                                    weight: b.weight,
+                                })
+                                .collect();
+
+                            let health = host_config
+                                .health
+                                .as_ref()
+                                .map(ResolvedHealthConfig::from)
+                                .unwrap_or_default();
+
+                            tcp_listeners.push(ResolvedTcpListener {
+                                addr,
+                                backends,
+                                health,
+                            });
+                        }
+                        continue; // Skip HTTP host processing for TCP listeners
+                    }
+
+                    // Handle HTTP listeners
                     if !seen_addrs.contains(&addr) {
                         seen_addrs.insert(addr);
                         let tls_config = if let Some(ssl) = &listen_config.ssl {
@@ -584,6 +817,11 @@ impl Config {
                         listeners.push(ResolvedListener { addr, tls_config });
                     }
                 }
+            }
+
+            // Skip path resolution for TCP hosts (they use backends, not paths)
+            if !host_config.backends.is_empty() && host_config.paths.is_empty() {
+                continue;
             }
 
             // Resolve routes
@@ -665,8 +903,9 @@ impl Config {
             hosts.insert(host_name.clone(), resolved_host);
         }
 
-        // Ensure we have at least the default listeners
-        if listeners.is_empty() {
+        // Ensure we have at least the default HTTP listener if no listeners defined
+        // (but only if there are HTTP hosts or no TCP listeners)
+        if listeners.is_empty() && !hosts.is_empty() {
             listeners.push(ResolvedListener {
                 addr: SocketAddr::from(([0, 0, 0, 0], 80)),
                 tls_config: None,
@@ -681,6 +920,7 @@ impl Config {
             global_headers,
             listeners,
             hosts,
+            tcp_listeners,
         })
     }
 }
@@ -1068,6 +1308,7 @@ mod tests {
         let config = ListenConfig {
             host: "127.0.0.1".to_string(),
             port: 8080,
+            listener_type: ListenerType::Http,
             ssl: None,
         };
         let addr = config.socket_addr();
@@ -1079,6 +1320,7 @@ mod tests {
         let config = ListenConfig {
             host: "0.0.0.0".to_string(),
             port: 443,
+            listener_type: ListenerType::Http,
             ssl: None,
         };
         let addr = config.socket_addr();
@@ -1645,5 +1887,258 @@ hosts: {}
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.limit_request_body, 107374182400); // 100GB
+    }
+
+    // =====================================================================
+    // TCP Proxy Configuration tests
+    // =====================================================================
+
+    #[test]
+    fn test_listener_type_parsing() {
+        // Test HTTP type
+        let yaml = "\"http\"";
+        let listener_type: ListenerType = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(listener_type, ListenerType::Http);
+
+        // Test TCP type
+        let yaml = "\"tcp\"";
+        let listener_type: ListenerType = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(listener_type, ListenerType::Tcp);
+
+        // Test case insensitivity
+        let yaml = "\"TCP\"";
+        let listener_type: ListenerType = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(listener_type, ListenerType::Tcp);
+    }
+
+    #[test]
+    fn test_listener_type_default() {
+        assert_eq!(ListenerType::default(), ListenerType::Http);
+    }
+
+    #[test]
+    fn test_listener_type_invalid() {
+        let yaml = "\"udp\"";
+        let result: Result<ListenerType, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_backend_config_parsing() {
+        let yaml = r#"
+host: 127.0.0.1
+port: 8080
+weight: 200
+"#;
+        let backend: BackendConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(backend.host, "127.0.0.1");
+        assert_eq!(backend.port, 8080);
+        assert_eq!(backend.weight, 200);
+    }
+
+    #[test]
+    fn test_backend_config_default_weight() {
+        let yaml = r#"
+host: 127.0.0.1
+port: 8080
+"#;
+        let backend: BackendConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(backend.weight, 100); // Default weight
+    }
+
+    #[test]
+    fn test_backend_config_socket_addr() {
+        let yaml = r#"
+host: 192.168.1.100
+port: 3306
+"#;
+        let backend: BackendConfig = serde_yaml::from_str(yaml).unwrap();
+        let addr = backend.socket_addr();
+        assert_eq!(addr.to_string(), "192.168.1.100:3306");
+    }
+
+    #[test]
+    fn test_health_config_parsing() {
+        let yaml = r#"
+interval: 10000
+timeout: 5000
+unhealthy-threshold: 5
+healthy-threshold: 2
+connect-timeout: 3000
+io-timeout: 60000
+sigma-threshold: 3.0
+latency-aware: ON
+"#;
+        let health: HealthConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(health.interval, 10000);
+        assert_eq!(health.timeout, 5000);
+        assert_eq!(health.unhealthy_threshold, 5);
+        assert_eq!(health.healthy_threshold, 2);
+        assert_eq!(health.connect_timeout, 3000);
+        assert_eq!(health.io_timeout, 60000);
+        assert_eq!(health.sigma_threshold, 3.0);
+        assert!(health.latency_aware.is_on());
+    }
+
+    #[test]
+    fn test_health_config_defaults() {
+        let health = HealthConfig::default();
+        assert_eq!(health.interval, 5000);
+        assert_eq!(health.timeout, 2000);
+        assert_eq!(health.unhealthy_threshold, 3);
+        assert_eq!(health.healthy_threshold, 3);
+        assert_eq!(health.connect_timeout, 5000);
+        assert_eq!(health.io_timeout, 30000);
+        assert_eq!(health.sigma_threshold, 2.0);
+        assert!(!health.latency_aware.is_on());
+    }
+
+    #[test]
+    fn test_resolved_health_config_from() {
+        let health = HealthConfig {
+            interval: 10000,
+            timeout: 5000,
+            unhealthy_threshold: 5,
+            healthy_threshold: 2,
+            connect_timeout: 3000,
+            io_timeout: 60000,
+            sigma_threshold: 3.0,
+            latency_aware: OnOff::On,
+        };
+        let resolved = ResolvedHealthConfig::from(&health);
+        assert_eq!(resolved.interval, Duration::from_millis(10000));
+        assert_eq!(resolved.timeout, Duration::from_millis(5000));
+        assert_eq!(resolved.unhealthy_threshold, 5);
+        assert_eq!(resolved.healthy_threshold, 2);
+        assert_eq!(resolved.connect_timeout, Duration::from_millis(3000));
+        assert_eq!(resolved.io_timeout, Duration::from_millis(60000));
+        assert_eq!(resolved.sigma_threshold, 3.0);
+        assert!(resolved.latency_aware);
+    }
+
+    #[test]
+    fn test_tcp_proxy_config_parsing() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4480":
+    listen:
+      host: 127.0.0.1
+      port: 4480
+      type: tcp
+    health:
+      interval: 10000
+      timeout: 3000
+      latency-aware: ON
+    backends:
+      - host: 127.0.0.1
+        port: 1234
+        weight: 200
+      - host: 127.0.0.1
+        port: 1235
+        weight: 100
+      - host: 127.0.0.1
+        port: 1237
+        weight: 50
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let host = config.hosts.get("127.0.0.1:4480").unwrap();
+
+        assert_eq!(host.backends.len(), 3);
+        assert_eq!(host.backends[0].port, 1234);
+        assert_eq!(host.backends[0].weight, 200);
+        assert_eq!(host.backends[1].port, 1235);
+        assert_eq!(host.backends[1].weight, 100);
+        assert_eq!(host.backends[2].port, 1237);
+        assert_eq!(host.backends[2].weight, 50);
+
+        let health = host.health.as_ref().unwrap();
+        assert_eq!(health.interval, 10000);
+        assert_eq!(health.timeout, 3000);
+        assert!(health.latency_aware.is_on());
+    }
+
+    #[test]
+    fn test_tcp_proxy_config_resolve() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4480":
+    listen:
+      host: 127.0.0.1
+      port: 4480
+      type: tcp
+    backends:
+      - host: 127.0.0.1
+        port: 1234
+        weight: 200
+      - host: 127.0.0.1
+        port: 1235
+        weight: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve().unwrap();
+
+        // Should have one TCP listener
+        assert_eq!(resolved.tcp_listeners.len(), 1);
+
+        let tcp_listener = &resolved.tcp_listeners[0];
+        assert_eq!(tcp_listener.addr.to_string(), "127.0.0.1:4480");
+        assert_eq!(tcp_listener.backends.len(), 2);
+        assert_eq!(tcp_listener.backends[0].weight, 200);
+        assert_eq!(tcp_listener.backends[1].weight, 100);
+
+        // Should not have HTTP hosts for TCP listeners
+        assert!(resolved.hosts.is_empty() || !resolved.hosts.contains_key("127.0.0.1:4480"));
+    }
+
+    #[test]
+    fn test_mixed_http_tcp_config() {
+        let yaml = r#"
+hosts:
+  "example.com:80":
+    listen:
+      host: 0.0.0.0
+      port: 80
+    paths:
+      "/":
+        status: ON
+  "127.0.0.1:4480":
+    listen:
+      host: 127.0.0.1
+      port: 4480
+      type: tcp
+    backends:
+      - host: 127.0.0.1
+        port: 1234
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve().unwrap();
+
+        // Should have one HTTP listener and one TCP listener
+        assert_eq!(resolved.listeners.len(), 1);
+        assert_eq!(resolved.tcp_listeners.len(), 1);
+
+        // HTTP host should be present
+        assert!(resolved.hosts.contains_key("example.com:80"));
+
+        // TCP listener should be configured
+        assert_eq!(resolved.tcp_listeners[0].addr.to_string(), "127.0.0.1:4480");
+    }
+
+    #[test]
+    fn test_tcp_config_no_backends_ignored() {
+        let yaml = r#"
+hosts:
+  "127.0.0.1:4480":
+    listen:
+      host: 127.0.0.1
+      port: 4480
+      type: tcp
+    backends: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve().unwrap();
+
+        // TCP listener without backends should be ignored
+        assert!(resolved.tcp_listeners.is_empty());
     }
 }

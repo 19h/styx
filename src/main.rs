@@ -8,6 +8,7 @@ mod pool;
 mod proxy;
 mod routing;
 mod server;
+mod tcp_proxy;
 mod tls;
 
 use clap::Parser;
@@ -110,6 +111,23 @@ fn main() -> anyhow::Result<()> {
 
     // Run server
     runtime.block_on(async {
+        // Start TCP proxies
+        let mut tcp_handles = Vec::new();
+        for tcp_listener in &resolved.tcp_listeners {
+            let tcp_proxy = tcp_proxy::TcpProxy::new(tcp_listener);
+            let handle = tokio::spawn(async move {
+                if let Err(e) = tcp_proxy.run().await {
+                    error!("TCP proxy failed: {}", e);
+                }
+            });
+            tcp_handles.push(handle);
+        }
+
+        if !resolved.tcp_listeners.is_empty() {
+            info!("Started {} TCP proxy listeners", resolved.tcp_listeners.len());
+        }
+
+        // Start HTTP server (only if there are HTTP hosts)
         let server = server::Server::new(resolved);
 
         // Handle shutdown signal

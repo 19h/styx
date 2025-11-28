@@ -5,8 +5,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
 // Re-use types from the main crate
 // Note: These tests are compiled separately from the main binary,
@@ -14,8 +12,6 @@ use std::time::Duration;
 
 /// Test that configuration files can be loaded and validated
 mod config_integration {
-    use super::*;
-
     #[test]
     fn test_yaml_config_syntax() {
         // Test that various YAML configurations parse correctly
@@ -92,7 +88,7 @@ hosts:
             ("status: 0", false),
         ];
 
-        for (yaml, expected_on) in test_cases {
+        for (yaml, _expected_on) in test_cases {
             let full_yaml = format!(
                 r#"
 hosts:
@@ -243,8 +239,6 @@ hosts:
 
 /// Test routing logic
 mod routing_integration {
-    use super::*;
-
     #[test]
     fn test_path_matching_priority() {
         // Verify longest-prefix-wins behavior
@@ -464,8 +458,6 @@ mod header_integration {
 
 /// Test URL and path handling
 mod url_integration {
-    use super::*;
-
     #[test]
     fn test_upstream_url_construction() {
         // Test how upstream URLs are constructed from config + request path
@@ -535,8 +527,6 @@ mod url_integration {
 
 /// Test connection pool behavior
 mod pool_integration {
-    use super::*;
-
     #[test]
     fn test_pool_key_generation() {
         // Test that pool keys are generated correctly for different hosts
@@ -609,8 +599,6 @@ mod tls_integration {
 
 /// Test error handling
 mod error_integration {
-    use super::*;
-
     #[test]
     fn test_http_status_codes() {
         // Test that appropriate status codes are used for various errors
