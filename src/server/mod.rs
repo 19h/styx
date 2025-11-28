@@ -174,7 +174,12 @@ impl Server {
             self.tls_manager
                 .load_cert("*", &tls_cfg.cert_path, &tls_cfg.key_path)?;
 
-            let server_config = self.tls_manager.build_server_config()?;
+            // Use HTTP/1-only config if HTTP/2 is disabled
+            let server_config = if self.config.http2.enabled {
+                self.tls_manager.build_server_config()?
+            } else {
+                self.tls_manager.build_server_config_http1_only()?
+            };
             Some(TlsAcceptor::from(server_config))
         } else {
             None
@@ -405,9 +410,9 @@ impl Server {
             .initial_connection_window_size(h2_config.initial_connection_window)
             .max_frame_size(h2_config.max_frame_size);
 
-        // Serve connection with overall timeout (5 minutes max per connection)
+        // Serve connection with idle timeout from config
         tokio::time::timeout(
-            Duration::from_secs(300),
+            Duration::from_secs(h2_config.idle_timeout),
             builder.serve_connection(
                 io,
                 service_fn(move |req| {

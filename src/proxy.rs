@@ -317,6 +317,116 @@ impl ReverseProxy {
         Ok(Response::from_parts(modified_parts, body))
     }
 
+    /// Proxy a request with a pre-collected body (for HTTP/3 support)
+    /// This method is used when the request body has already been read
+    pub async fn proxy_with_body(
+        &self,
+        method: http::Method,
+        uri: &http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        upstream_url: &str,
+        preserve_host: bool,
+        proxy_headers: &HeaderRules,
+        response_headers: &HeaderRules,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<Response<Bytes>, ProxyError> {
+        // Parse upstream URL
+        let upstream = parse_upstream_url(upstream_url, uri)?;
+        let (host, port) = extract_host_port(&upstream)?;
+
+        // Prepare headers
+        let mut headers = headers;
+
+        // Validate Host header
+        if let Some(host_hdr) = headers.get(header::HOST) {
+            if let Ok(host_str) = host_hdr.to_str() {
+                validate_host_header(host_str)?;
+            }
+        }
+
+        strip_forwarded_headers(&mut headers);
+
+        // Set host header
+        if preserve_host {
+            if !headers.contains_key(header::HOST) {
+                if let Ok(host_value) = HeaderValue::from_str(&host) {
+                    headers.insert(header::HOST, host_value);
+                }
+            }
+        } else {
+            let host_with_port = if port == 80 || port == 443 {
+                host.clone()
+            } else {
+                format!("{}:{}", host, port)
+            };
+            if let Ok(host_value) = HeaderValue::from_str(&host_with_port) {
+                headers.insert(header::HOST, host_value);
+            }
+        }
+
+        // Manually add X-Forwarded-Proto
+        let proto = if uri.scheme_str() == Some("https") { "https" } else { "http" };
+        if let Ok(value) = HeaderValue::from_str(proto) {
+            headers.insert(HeaderName::from_static("x-forwarded-proto"), value);
+        }
+
+        // Add X-Forwarded-Host
+        if let Some(host_hdr) = headers.get(header::HOST) {
+            headers.insert(HeaderName::from_static("x-forwarded-host"), host_hdr.clone());
+        }
+
+        if let Some(ip) = client_ip {
+            if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
+                headers.insert(HeaderName::from_static("x-forwarded-for"), value);
+            }
+        }
+
+        apply_request_headers(&mut headers, proxy_headers);
+        remove_hop_headers(&mut headers);
+
+        // Build request
+        let mut proxy_request = Request::builder()
+            .method(method)
+            .uri(&upstream)
+            .version(Version::HTTP_11);
+
+        for (name, value) in headers.iter() {
+            proxy_request = proxy_request.header(name.clone(), value.clone());
+        }
+
+        let proxy_request = proxy_request
+            .body(Full::new(body))
+            .map_err(|e| ProxyError::Request(e.to_string()))?;
+
+        // Determine if we should use TLS
+        let parsed_upstream: Uri = upstream.parse().unwrap();
+        let use_tls = parsed_upstream.scheme_str() == Some("https");
+
+        // Send request through connection pool
+        let response = tokio::time::timeout(
+            self.config.io_timeout,
+            self.pool.send_request(&host, port, use_tls, proxy_request),
+        )
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+
+        // Apply response headers and collect body
+        let (mut parts, body) = response.into_parts();
+        remove_hop_headers(&mut parts.headers);
+
+        // Apply response header rules
+        let mut temp_response = Response::from_parts(parts.clone(), Full::new(Bytes::new()));
+        apply_response_headers(&mut temp_response, response_headers);
+        let (modified_parts, _) = temp_response.into_parts();
+
+        // Collect response body
+        let body_bytes = collect_body_incoming(body, self.config.max_body_size).await?;
+
+        Ok(Response::from_parts(modified_parts, body_bytes))
+    }
+
     /// Send a streaming request using a direct connection (no pooling)
     /// Supports HTTP/2 for TLS connections via ALPN negotiation
     async fn send_streaming_request(
@@ -575,6 +685,27 @@ async fn collect_body(body: &mut Incoming, max_size: u64) -> Result<Bytes, Proxy
 
         if let Some(data) = frame.data_ref() {
             // Check size BEFORE adding to buffer
+            let new_size = buf.len() + data.len();
+            if new_size as u64 > max_size {
+                return Err(ProxyError::BodyTooLarge);
+            }
+            buf.extend_from_slice(data);
+        }
+    }
+
+    Ok(buf.freeze())
+}
+
+/// Collect body from Incoming into Bytes with size limit
+async fn collect_body_incoming(mut body: Incoming, max_size: u64) -> Result<Bytes, ProxyError> {
+    use bytes::BytesMut;
+
+    let mut buf = BytesMut::new();
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| ProxyError::Body(e.to_string()))?;
+
+        if let Some(data) = frame.data_ref() {
             let new_size = buf.len() + data.len();
             if new_size as u64 > max_size {
                 return Err(ProxyError::BodyTooLarge);

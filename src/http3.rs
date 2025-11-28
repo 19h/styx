@@ -3,7 +3,7 @@
 //! This module provides HTTP/3 support via QUIC transport, enabling
 //! low-latency connections with built-in multiplexing and encryption.
 
-use crate::config::{Http3Config, ResolvedConfig, RouteAction, TlsListenerConfig};
+use crate::config::{HeaderRules, Http3Config, ResolvedConfig, RouteAction, TlsListenerConfig};
 use crate::middleware::{
     apply_expires, apply_response_headers, default_security_headers, redirect_response,
     status_response,
@@ -12,7 +12,7 @@ use crate::proxy::ReverseProxy;
 use crate::routing::{MatchResult, Router};
 use crate::server::static_files::{serve_static_h3, StaticFileConfig};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use h3::server::RequestStream;
 use http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
@@ -247,6 +247,7 @@ impl Http3Server {
                     // Resolve the request to get (request, stream)
                     let stats = Arc::clone(&self.stats);
                     let router = Arc::clone(&self.router);
+                    let proxy = Arc::clone(&self.proxy);
                     let config = Arc::clone(&self.config);
 
                     tokio::spawn(async move {
@@ -257,6 +258,7 @@ impl Http3Server {
                                     stream,
                                     peer_addr,
                                     router,
+                                    proxy,
                                     config,
                                 ).await {
                                     debug!("HTTP/3 request error: {}", e);
@@ -292,6 +294,7 @@ async fn handle_request<S>(
     mut stream: RequestStream<S, Bytes>,
     peer_addr: SocketAddr,
     router: Arc<Router>,
+    proxy: Arc<ReverseProxy>,
     config: Arc<ResolvedConfig>,
 ) -> anyhow::Result<()>
 where
@@ -324,8 +327,11 @@ where
         }
     };
 
+    // Read request body from stream (needed for proxy)
+    let request_body = read_request_body(&mut stream).await.unwrap_or_default();
+
     // Execute the action
-    let response = match execute_action(&request, &result, &config).await {
+    let response = match execute_action(&request, request_body, &result, &proxy, &config, peer_addr).await {
         Ok(r) => r,
         Err(e) => {
             warn!("HTTP/3 request error: {}", e);
@@ -354,11 +360,34 @@ where
     Ok(())
 }
 
+/// Read the request body from an HTTP/3 stream
+async fn read_request_body<S>(stream: &mut RequestStream<S, Bytes>) -> anyhow::Result<Bytes>
+where
+    S: h3::quic::BidiStream<Bytes> + Send,
+{
+    use bytes::BytesMut;
+
+    let mut body = BytesMut::new();
+    const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
+
+    while let Some(data) = stream.recv_data().await? {
+        if body.len() + data.remaining() > MAX_BODY_SIZE {
+            anyhow::bail!("Request body too large");
+        }
+        body.extend_from_slice(data.chunk());
+    }
+
+    Ok(body.freeze())
+}
+
 /// Execute a route action
 async fn execute_action(
     request: &Request<()>,
+    request_body: Bytes,
     route: &MatchResult,
+    proxy: &ReverseProxy,
     config: &ResolvedConfig,
+    peer_addr: SocketAddr,
 ) -> Result<Response<Bytes>, anyhow::Error> {
     let global_headers = default_security_headers().merge_with(&config.global_headers);
 
@@ -412,14 +441,36 @@ async fn execute_action(
             }
         }
 
-        RouteAction::Proxy { upstream: _, preserve_host: _ } => {
-            // HTTP/3 proxy support is not yet implemented
-            // Proxying requires reading the request body from the QUIC stream
-            // and forwarding it to the upstream, which needs more work
-            Ok(Response::builder()
-                .status(StatusCode::NOT_IMPLEMENTED)
-                .body(Bytes::from("HTTP/3 proxy support coming soon"))
-                .unwrap())
+        RouteAction::Proxy { upstream, preserve_host } => {
+            // Merge proxy headers
+            let merged_proxy_headers = global_headers.merge_with(&route.headers);
+            let response_headers = HeaderRules::default();
+
+            // Forward the request to the upstream
+            let response = proxy.proxy_with_body(
+                request.method().clone(),
+                request.uri(),
+                request.headers().clone(),
+                request_body,
+                upstream,
+                *preserve_host,
+                &merged_proxy_headers,
+                &response_headers,
+                Some(peer_addr.ip()),
+            ).await?;
+
+            // Apply response headers
+            let (parts, body) = response.into_parts();
+            let merged_response_headers = global_headers.merge_with(&route.headers);
+
+            // Create temp response to apply headers
+            let mut temp_response = Response::from_parts(parts.clone(), Bytes::new());
+            apply_response_headers(&mut temp_response, &merged_response_headers);
+            apply_expires(&mut temp_response, route.expires);
+
+            let (modified_parts, _) = temp_response.into_parts();
+
+            Ok(Response::from_parts(modified_parts, body))
         }
     }
 }
@@ -448,6 +499,13 @@ fn load_private_key<R: std::io::BufRead>(reader: &mut R) -> anyhow::Result<Priva
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Http2Config, Http3Config};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // =========================================================================
+    // Http3Stats tests
+    // =========================================================================
 
     #[test]
     fn test_http3_stats_default() {
@@ -455,6 +513,9 @@ mod tests {
         assert_eq!(stats.requests.load(Ordering::Relaxed), 0);
         assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
         assert_eq!(stats.errors.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.handshakes_started.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.handshakes_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.handshakes_failed.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -471,7 +532,495 @@ mod tests {
     }
 
     #[test]
+    fn test_http3_stats_handshake_tracking() {
+        let stats = Http3Stats::default();
+
+        // Simulate handshake lifecycle
+        stats.handshakes_started.fetch_add(100, Ordering::Relaxed);
+        stats.handshakes_completed.fetch_add(95, Ordering::Relaxed);
+        stats.handshakes_failed.fetch_add(5, Ordering::Relaxed);
+
+        assert_eq!(stats.handshakes_started.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.handshakes_completed.load(Ordering::Relaxed), 95);
+        assert_eq!(stats.handshakes_failed.load(Ordering::Relaxed), 5);
+
+        // Verify started = completed + failed
+        assert_eq!(
+            stats.handshakes_started.load(Ordering::Relaxed),
+            stats.handshakes_completed.load(Ordering::Relaxed)
+                + stats.handshakes_failed.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn test_http3_stats_concurrent_updates() {
+        use std::thread;
+
+        let stats = Arc::new(Http3Stats::default());
+        let mut handles = vec![];
+
+        // Spawn multiple threads updating stats
+        for _ in 0..10 {
+            let stats_clone = Arc::clone(&stats);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    stats_clone.requests.fetch_add(1, Ordering::Relaxed);
+                    stats_clone.active_connections.fetch_add(1, Ordering::Relaxed);
+                    stats_clone.active_connections.fetch_sub(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(stats.requests.load(Ordering::Relaxed), 1000);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    // =========================================================================
+    // ALPN constant tests
+    // =========================================================================
+
+    #[test]
     fn test_alpn_h3_constant() {
         assert_eq!(ALPN_H3, b"h3");
+    }
+
+    #[test]
+    fn test_alpn_h3_is_valid_utf8() {
+        assert!(std::str::from_utf8(ALPN_H3).is_ok());
+        assert_eq!(std::str::from_utf8(ALPN_H3).unwrap(), "h3");
+    }
+
+    // =========================================================================
+    // Http3Config tests
+    // =========================================================================
+
+    #[test]
+    fn test_http3_config_default() {
+        let config = Http3Config::default();
+        assert!(!config.enabled);
+        assert_eq!(config.max_concurrent_streams, 256);
+        assert_eq!(config.idle_timeout, 30);
+        assert_eq!(config.stream_receive_window, 1024 * 1024);
+        assert_eq!(config.connection_receive_window, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_http3_config_custom() {
+        let config = Http3Config {
+            enabled: true,
+            max_concurrent_streams: 512,
+            idle_timeout: 60,
+            stream_receive_window: 2 * 1024 * 1024,
+            connection_receive_window: 4 * 1024 * 1024,
+        };
+
+        assert!(config.enabled);
+        assert_eq!(config.max_concurrent_streams, 512);
+        assert_eq!(config.idle_timeout, 60);
+    }
+
+    #[test]
+    fn test_http3_config_clone() {
+        let config1 = Http3Config {
+            enabled: true,
+            max_concurrent_streams: 100,
+            idle_timeout: 45,
+            stream_receive_window: 512 * 1024,
+            connection_receive_window: 1024 * 1024,
+        };
+
+        let config2 = config1.clone();
+
+        assert_eq!(config1.enabled, config2.enabled);
+        assert_eq!(config1.max_concurrent_streams, config2.max_concurrent_streams);
+        assert_eq!(config1.idle_timeout, config2.idle_timeout);
+    }
+
+    // =========================================================================
+    // load_private_key tests
+    // =========================================================================
+
+    #[test]
+    fn test_load_private_key_empty_reader() {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let result = load_private_key(&mut reader);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No private key found"));
+    }
+
+    #[test]
+    fn test_load_private_key_invalid_pem() {
+        let invalid_pem = b"not a valid pem file";
+        let mut reader = std::io::Cursor::new(invalid_pem.as_slice());
+        let result = load_private_key(&mut reader);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_private_key_certificate_only() {
+        // A PEM file with only a certificate, no private key
+        let cert_pem = r#"-----BEGIN CERTIFICATE-----
+MIIBkjCB/AIJAKHBfpEgcMFvMA0GCSqGSIb3DQEBCwUAMBExDzANBgNVBAMMBnVu
+dXNlZDAeFw0yMDAxMDEwMDAwMDBaFw0zMDAxMDEwMDAwMDBaMBExDzANBgNVBAMM
+BnVudXNlZDBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQC6mCz0rj2/P6rLkhT7RBHN
+gXE6kW6VVl5Y0J/GkEHqJA8RWEA8jPx7w7tOQ8cPj+3oKx8I+qVhKqIbEf1Gi/LN
+AgMBAAEwDQYJKoZIhvcNAQELBQADQQBU9VLRvlVux3r2wPhi/HEvOIB9FQg4NDNF
+cjSBFnGNTJhEj8LnALVkOW7VG8cWB0fZ/M7X9qvB3R0u9RvOYl5E
+-----END CERTIFICATE-----"#;
+        let mut reader = std::io::Cursor::new(cert_pem.as_bytes());
+        let result = load_private_key(&mut reader);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Http3Server creation tests
+    // =========================================================================
+
+    fn create_test_config() -> ResolvedConfig {
+        ResolvedConfig {
+            num_threads: 4,
+            pid_file: None,
+            hosts: HashMap::new(),
+            listeners: vec![],
+            global_headers: HeaderRules::default(),
+            proxy_timeout_io: Duration::from_secs(30),
+            limit_request_body: 10 * 1024 * 1024,
+            tcp_listeners: vec![],
+            http2: Http2Config::default(),
+            http3: Http3Config {
+                enabled: true,
+                max_concurrent_streams: 256,
+                idle_timeout: 30,
+                stream_receive_window: 1024 * 1024,
+                connection_receive_window: 2 * 1024 * 1024,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http3_server_creation() {
+        let config = Arc::new(create_test_config());
+        let router = Arc::new(Router::new(&config.hosts));
+        let proxy = ReverseProxy::new(crate::proxy::ProxyConfig::default());
+
+        let server = Http3Server::new(
+            Arc::clone(&config),
+            router,
+            proxy,
+        );
+
+        assert!(server.h3_config.enabled);
+        assert_eq!(server.h3_config.max_concurrent_streams, 256);
+    }
+
+    #[tokio::test]
+    async fn test_http3_server_disabled() {
+        let mut config = create_test_config();
+        config.http3.enabled = false;
+        let config = Arc::new(config);
+        let router = Arc::new(Router::new(&config.hosts));
+        let proxy = ReverseProxy::new(crate::proxy::ProxyConfig::default());
+
+        let server = Http3Server::new(
+            Arc::clone(&config),
+            router,
+            proxy,
+        );
+
+        assert!(!server.h3_config.enabled);
+    }
+
+    // =========================================================================
+    // Route action tests (execute_action)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_execute_action_redirect() {
+        let config = create_test_config();
+        let proxy = ReverseProxy::new(crate::proxy::ProxyConfig::default());
+
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/old-page")
+            .body(())
+            .unwrap();
+
+        let route = MatchResult {
+            action: RouteAction::Redirect {
+                url: "https://example.com/new-page".to_string(),
+                status: 301,
+            },
+            headers: HeaderRules::default(),
+            proxy_headers: HeaderRules::default(),
+            matched_path: "/old-page".to_string(),
+            expires: None,
+        };
+
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let result = execute_action(&request, Bytes::new(), &route, &proxy, &config, peer_addr).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert!(response.headers().get("location").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_status() {
+        let config = create_test_config();
+        let proxy = ReverseProxy::new(crate::proxy::ProxyConfig::default());
+
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/status")
+            .body(())
+            .unwrap();
+
+        let route = MatchResult {
+            action: RouteAction::Status,
+            headers: HeaderRules::default(),
+            proxy_headers: HeaderRules::default(),
+            matched_path: "/status".to_string(),
+            expires: None,
+        };
+
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let result = execute_action(&request, Bytes::new(), &route, &proxy, &config, peer_addr).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_static_not_found() {
+        let config = create_test_config();
+        let proxy = ReverseProxy::new(crate::proxy::ProxyConfig::default());
+
+        // Use temp directory which exists but has no files
+        let temp_dir = std::env::temp_dir();
+
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/definitely_nonexistent_file_12345.html")
+            .body(())
+            .unwrap();
+
+        let route = MatchResult {
+            action: RouteAction::StaticFiles {
+                dir: temp_dir,
+                index: vec!["index.html".to_string()],
+                send_gzip: false,
+                dirlisting: false,
+            },
+            headers: HeaderRules::default(),
+            proxy_headers: HeaderRules::default(),
+            matched_path: "/".to_string(),
+            expires: None,
+        };
+
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let result = execute_action(&request, Bytes::new(), &route, &proxy, &config, peer_addr).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Request/Response header tests
+    // =========================================================================
+
+    #[test]
+    fn test_host_header_from_uri() {
+        // In HTTP/3, the authority comes from the URI, not a header
+        // The http crate doesn't allow pseudo-headers as regular headers
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/path")
+            .body(())
+            .unwrap();
+
+        // Extract host from URI authority
+        let host = request.uri().host().unwrap_or("");
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn test_host_header_fallback() {
+        // Test fallback to Host header when :authority is missing
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/path")
+            .header("host", "fallback.com")
+            .body(())
+            .unwrap();
+
+        let host = request
+            .headers()
+            .get(http::header::HOST)
+            .or_else(|| request.headers().get(":authority"))
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+
+        assert_eq!(host, "fallback.com");
+    }
+
+    #[test]
+    fn test_empty_host_header() {
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/path")
+            .body(())
+            .unwrap();
+
+        let host = request
+            .headers()
+            .get(http::header::HOST)
+            .or_else(|| request.headers().get(":authority"))
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("default.host");
+
+        assert_eq!(host, "default.host");
+    }
+
+    // =========================================================================
+    // Integration-style tests
+    // =========================================================================
+
+    #[test]
+    fn test_quic_transport_config_values() {
+        let config = Http3Config {
+            enabled: true,
+            max_concurrent_streams: 100,
+            idle_timeout: 60,
+            stream_receive_window: 512 * 1024,
+            connection_receive_window: 1024 * 1024,
+        };
+
+        // Verify VarInt conversions work for all config values
+        let _streams: quinn::VarInt = config.max_concurrent_streams.into();
+        let _stream_window: quinn::VarInt = config.stream_receive_window.into();
+        let _conn_window: quinn::VarInt = config.connection_receive_window.into();
+
+        // Verify timeout conversion works
+        let timeout = Duration::from_secs(config.idle_timeout);
+        assert_eq!(timeout.as_secs(), 60);
+    }
+
+    #[test]
+    fn test_response_building() {
+        // Test that we can build responses correctly for HTTP/3
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body(())
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn test_error_response_building() {
+        let statuses = vec![
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ];
+
+        for status in statuses {
+            let response = Response::builder()
+                .status(status)
+                .body(Bytes::from("error"))
+                .unwrap();
+
+            assert_eq!(response.status(), status);
+            assert!(!response.body().is_empty());
+        }
+    }
+
+    // =========================================================================
+    // Proxy integration tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_proxy_action_with_invalid_upstream() {
+        let config = create_test_config();
+        let proxy = ReverseProxy::new(crate::proxy::ProxyConfig::default());
+
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/api/test")
+            .header("host", "example.com")
+            .body(())
+            .unwrap();
+
+        // Invalid upstream URL that will fail validation
+        let route = MatchResult {
+            action: RouteAction::Proxy {
+                upstream: "http://127.0.0.1:99999".to_string(), // Invalid - localhost blocked
+                preserve_host: false,
+            },
+            headers: HeaderRules::default(),
+            proxy_headers: HeaderRules::default(),
+            matched_path: "/api".to_string(),
+            expires: None,
+        };
+
+        let peer_addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let result = execute_action(&request, Bytes::new(), &route, &proxy, &config, peer_addr).await;
+
+        // Should fail due to SSRF protection (localhost is blocked)
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Bytes body handling tests
+    // =========================================================================
+
+    #[test]
+    fn test_bytes_empty() {
+        let body = Bytes::new();
+        assert!(body.is_empty());
+        assert_eq!(body.len(), 0);
+    }
+
+    #[test]
+    fn test_bytes_from_static() {
+        let body = Bytes::from("Hello, HTTP/3!");
+        assert!(!body.is_empty());
+        assert_eq!(body.len(), 14);
+    }
+
+    #[test]
+    fn test_bytes_from_vec() {
+        let data = vec![1u8, 2, 3, 4, 5];
+        let body = Bytes::from(data);
+        assert_eq!(body.len(), 5);
+        assert_eq!(body.chunk(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_response_with_bytes_body() {
+        let body = Bytes::from("Test response body");
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .header("content-length", body.len().to_string())
+            .body(body.clone())
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().len(), 18);
     }
 }
