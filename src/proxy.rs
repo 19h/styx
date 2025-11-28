@@ -175,11 +175,23 @@ impl ReverseProxy {
         
         apply_request_headers(&mut headers, proxy_headers);
         remove_hop_headers(&mut headers);
-        
+
         // Build streaming request
+        // When preserve_host is true, use origin-form (path only) to prevent backend from using URL
+        // When preserve_host is false, use absolute-form (full URL)
+        let request_uri = if preserve_host {
+            // Origin form: just path and query
+            request.uri().path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+        } else {
+            // Absolute form: full upstream URL
+            upstream.as_str()
+        };
+
         let mut proxy_request = Request::builder()
             .method(request.method().clone())
-            .uri(&upstream)
+            .uri(request_uri)
             .version(Version::HTTP_11);
         
         for (name, value) in headers.iter() {
@@ -235,9 +247,21 @@ impl ReverseProxy {
         let body_bytes = collect_body(request.body_mut(), self.config.max_body_size).await?;
 
         // Build new request
+        // When preserve_host is true, use origin-form (path only) to prevent backend from using URL
+        // When preserve_host is false, use absolute-form (full URL)
+        let request_uri = if preserve_host {
+            // Origin form: just path and query
+            request.uri().path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+        } else {
+            // Absolute form: full upstream URL
+            upstream.as_str()
+        };
+
         let mut proxy_request = Request::builder()
             .method(request.method().clone())
-            .uri(&upstream)
+            .uri(request_uri)
             .version(Version::HTTP_11);
 
         // Copy headers
@@ -420,9 +444,21 @@ impl ReverseProxy {
         remove_hop_headers(&mut headers);
 
         // Build request
+        // When preserve_host is true, use origin-form (path only) to prevent backend from using URL
+        // When preserve_host is false, use absolute-form (full URL)
+        let request_uri = if preserve_host {
+            // Origin form: just path and query
+            uri.path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+        } else {
+            // Absolute form: full upstream URL
+            upstream.as_str()
+        };
+
         let mut proxy_request = Request::builder()
             .method(method)
-            .uri(&upstream)
+            .uri(request_uri)
             .version(Version::HTTP_11);
 
         for (name, value) in headers.iter() {
