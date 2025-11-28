@@ -180,13 +180,15 @@ impl ReverseProxy {
         // When preserve_host is true, use origin-form (path only) to prevent backend from using URL
         // When preserve_host is false, use absolute-form (full URL)
         let request_uri = if preserve_host {
-            // Origin form: just path and query
-            request.uri().path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/")
+            // Origin form: extract path and query from the combined upstream URL
+            let upstream_uri: Uri = upstream.parse()
+                .map_err(|e| ProxyError::InvalidUpstream(format!("Failed to parse upstream URL: {}", e)))?;
+            upstream_uri.path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string())
         } else {
             // Absolute form: full upstream URL
-            upstream.as_str()
+            upstream.clone()
         };
 
         let mut proxy_request = Request::builder()
@@ -250,13 +252,15 @@ impl ReverseProxy {
         // When preserve_host is true, use origin-form (path only) to prevent backend from using URL
         // When preserve_host is false, use absolute-form (full URL)
         let request_uri = if preserve_host {
-            // Origin form: just path and query
-            request.uri().path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/")
+            // Origin form: extract path and query from the combined upstream URL
+            let upstream_uri: Uri = upstream.parse()
+                .map_err(|e| ProxyError::InvalidUpstream(format!("Failed to parse upstream URL: {}", e)))?;
+            upstream_uri.path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string())
         } else {
             // Absolute form: full upstream URL
-            upstream.as_str()
+            upstream.clone()
         };
 
         let mut proxy_request = Request::builder()
@@ -447,13 +451,15 @@ impl ReverseProxy {
         // When preserve_host is true, use origin-form (path only) to prevent backend from using URL
         // When preserve_host is false, use absolute-form (full URL)
         let request_uri = if preserve_host {
-            // Origin form: just path and query
-            uri.path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/")
+            // Origin form: extract path and query from the combined upstream URL
+            let upstream_uri: Uri = upstream.parse()
+                .map_err(|e| ProxyError::InvalidUpstream(format!("Failed to parse upstream URL: {}", e)))?;
+            upstream_uri.path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string())
         } else {
             // Absolute form: full upstream URL
-            upstream.as_str()
+            upstream.clone()
         };
 
         let mut proxy_request = Request::builder()
