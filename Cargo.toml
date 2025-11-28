@@ -47,6 +47,7 @@ futures-util = "0.3"
 smallvec = "1.13"
 ahash = "0.8"
 indexmap = { version = "2.7", features = ["serde"] }
+crossbeam = "0.8"
 
 # Connection pooling
 deadpool = "0.12"

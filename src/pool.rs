@@ -5,19 +5,19 @@
 //! connection reuse and health monitoring.
 
 use bytes::Bytes;
+use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use tracing::trace;
@@ -57,32 +57,35 @@ struct PooledConnection {
     last_used: Instant,
 }
 
-/// Connection pool entry for a single host
+/// Connection pool entry for a single host (lock-free design)
 struct HostPool {
-    /// Idle connections ready for reuse
-    idle: VecDeque<PooledConnection>,
+    /// Idle connections ready for reuse (lock-free queue)
+    idle: Arc<SegQueue<PooledConnection>>,
     /// Semaphore to limit concurrent connections
     semaphore: Arc<Semaphore>,
     /// Statistics
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Current idle connection count (approximate)
+    idle_count: AtomicUsize,
 }
 
 impl HostPool {
     fn new(max_connections: usize) -> Self {
         Self {
-            idle: VecDeque::with_capacity(32),
+            idle: Arc::new(SegQueue::new()),
             semaphore: Arc::new(Semaphore::new(max_connections)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            idle_count: AtomicUsize::new(0),
         }
     }
 }
 
-/// High-performance connection pool
+/// High-performance connection pool (lock-free design)
 pub struct ConnectionPool {
     config: PoolConfig,
-    pools: DashMap<String, Arc<Mutex<HostPool>>>,
+    pools: DashMap<String, Arc<HostPool>>,
     /// Global statistics
     total_requests: AtomicU64,
     active_connections: AtomicUsize,
@@ -108,14 +111,14 @@ impl ConnectionPool {
     }
 
     /// Get or create pool for a host
-    fn get_or_create_pool(&self, key: &str) -> Arc<Mutex<HostPool>> {
+    fn get_or_create_pool(&self, key: &str) -> Arc<HostPool> {
         self.pools
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(HostPool::new(self.config.max_connections_per_host))))
+            .or_insert_with(|| Arc::new(HostPool::new(self.config.max_connections_per_host)))
             .clone()
     }
 
-    /// Send a request through the pool
+    /// Send a request through the pool (lock-free)
     pub async fn send_request(
         self: &Arc<Self>,
         host: &str,
@@ -128,20 +131,17 @@ impl ConnectionPool {
         let key = format!("{}:{}:{}", if use_tls { "https" } else { "http" }, host, port);
         let pool = self.get_or_create_pool(&key);
 
-        // Try to get an idle connection (hold lock briefly)
-        let (mut conn, semaphore) = {
-            let mut pool_guard = pool.lock().await;
-            let conn = self.get_idle_connection(&mut pool_guard);
-            let semaphore = pool_guard.semaphore.clone();
-            if conn.is_some() {
-                pool_guard.hits.fetch_add(1, Ordering::Relaxed);
-            }
-            (conn, semaphore)
-        };
+        // Try to get an idle connection (lock-free!)
+        let mut conn = self.get_idle_connection(&pool);
+        let semaphore = pool.semaphore.clone();
+        
+        if conn.is_some() {
+            pool.hits.fetch_add(1, Ordering::Relaxed);
+        }
 
         // If no idle connection, create a new one
         if conn.is_none() {
-            // Acquire semaphore permit with timeout (outside of lock!)
+            // Acquire semaphore permit with timeout
             let _permit = tokio::time::timeout(
                 Duration::from_secs(30), // Don't wait forever
                 semaphore.acquire_owned()
@@ -150,10 +150,7 @@ impl ConnectionPool {
             .map_err(|_| PoolError::AcquireTimeout)?
             .map_err(|_| PoolError::PoolExhausted)?;
 
-            {
-                let pool_guard = pool.lock().await;
-                pool_guard.misses.fetch_add(1, Ordering::Relaxed);
-            }
+            pool.misses.fetch_add(1, Ordering::Relaxed);
 
             conn = Some(self.create_connection(host, port, use_tls).await?);
             self.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -167,12 +164,13 @@ impl ConnectionPool {
             PoolError::Request(e.to_string())
         })?;
 
-        // Return connection to pool if still usable
+        // Return connection to pool if still usable (lock-free!)
         if sender.sender.is_ready() {
             sender.last_used = Instant::now();
-            let mut pool_guard = pool.lock().await;
-            if pool_guard.idle.len() < self.config.max_idle_per_host {
-                pool_guard.idle.push_back(sender);
+            let current_idle = pool.idle_count.load(Ordering::Relaxed);
+            if current_idle < self.config.max_idle_per_host {
+                pool.idle.push(sender);
+                pool.idle_count.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.active_connections.fetch_sub(1, Ordering::Relaxed);
             }
@@ -183,38 +181,48 @@ impl ConnectionPool {
         Ok(response)
     }
 
-    /// Get an idle connection from the pool
-    fn get_idle_connection(&self, pool: &mut HostPool) -> Option<PooledConnection> {
+    /// Get an idle connection from the pool (lock-free)
+    fn get_idle_connection(&self, pool: &Arc<HostPool>) -> Option<PooledConnection> {
         let now = Instant::now();
 
-        while let Some(conn) = pool.idle.pop_front() {
-            // Check if connection is still valid
-            if now.duration_since(conn.last_used) < self.config.idle_timeout
-                && conn.sender.is_ready()
-            {
-                return Some(conn);
+        // Try to pop connections until we find a valid one
+        loop {
+            match pool.idle.pop() {
+                Some(conn) => {
+                    pool.idle_count.fetch_sub(1, Ordering::Relaxed);
+                    
+                    // Check if connection is still valid
+                    if now.duration_since(conn.last_used) < self.config.idle_timeout
+                        && conn.sender.is_ready()
+                    {
+                        return Some(conn);
+                    }
+                    // Connection expired, drop it and try next
+                    self.active_connections.fetch_sub(1, Ordering::Relaxed);
+                }
+                None => return None,
             }
-            // Connection expired, drop it
-            self.active_connections.fetch_sub(1, Ordering::Relaxed);
         }
-
-        None
     }
 
     /// Create a new connection to the upstream
     async fn create_connection(&self, host: &str, port: u16, use_tls: bool) -> Result<PooledConnection, PoolError> {
-        let addr = resolve_host(host, port).await?;
+        // Resolve all addresses for Happy Eyeballs
+        let addrs = resolve_host_all(host, port).await?;
 
-        // Validate resolved IP to prevent DNS rebinding attacks
-        validate_resolved_ip(addr.ip())?;
+        // Validate all resolved IPs to prevent DNS rebinding attacks
+        for addr in &addrs {
+            validate_resolved_ip(addr.ip())?;
+        }
 
-        let stream = tokio::time::timeout(
+        // Happy Eyeballs: try all addresses with quick fallback
+        let (stream, _connected_addr) = tokio::time::timeout(
             self.config.connect_timeout,
-            TcpStream::connect(addr),
+            connect_with_happy_eyeballs(&addrs, self.config.connect_timeout),
         )
         .await
         .map_err(|_| PoolError::ConnectTimeout)?
-        .map_err(|e| PoolError::Connect(e.to_string()))?;
+        .map_err(|e| e)?;
 
         // Set TCP options
         stream.set_nodelay(true).ok();
@@ -284,7 +292,7 @@ impl ConnectionPool {
         }
     }
 
-    /// Background cleanup of idle connections
+    /// Background cleanup of idle connections (lock-free)
     async fn cleanup_loop(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -294,14 +302,31 @@ impl ConnectionPool {
             let now = Instant::now();
 
             for entry in self.pools.iter() {
-                let mut pool = entry.value().lock().await;
-                let before = pool.idle.len();
+                let pool = entry.value();
+                let mut removed = 0;
+                let mut valid_conns = Vec::new();
 
-                pool.idle.retain(|conn| {
-                    now.duration_since(conn.last_used) < self.config.idle_timeout
-                });
+                // Drain all connections from the queue
+                while let Some(conn) = pool.idle.pop() {
+                    pool.idle_count.fetch_sub(1, Ordering::Relaxed);
+                    
+                    if now.duration_since(conn.last_used) < self.config.idle_timeout
+                        && conn.sender.is_ready()
+                    {
+                        // Still valid, keep it
+                        valid_conns.push(conn);
+                    } else {
+                        // Expired or dead, drop it
+                        removed += 1;
+                    }
+                }
 
-                let removed = before - pool.idle.len();
+                // Push valid connections back
+                for conn in valid_conns {
+                    pool.idle.push(conn);
+                    pool.idle_count.fetch_add(1, Ordering::Relaxed);
+                }
+
                 if removed > 0 {
                     self.active_connections.fetch_sub(removed, Ordering::Relaxed);
                     trace!("Cleaned up {} idle connections for {}", removed, entry.key());
@@ -312,19 +337,53 @@ impl ConnectionPool {
 
 }
 
-/// Resolve hostname to socket address
-async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, PoolError> {
+/// Resolve hostname to all socket addresses (for Happy Eyeballs)
+async fn resolve_host_all(host: &str, port: u16) -> Result<Vec<SocketAddr>, PoolError> {
     use tokio::net::lookup_host;
 
     let addr_str = format!("{}:{}", host, port);
 
-    let mut addrs = lookup_host(&addr_str)
+    let addrs: Vec<SocketAddr> = lookup_host(&addr_str)
         .await
-        .map_err(|e| PoolError::Resolve(e.to_string()))?;
+        .map_err(|e| PoolError::Resolve(e.to_string()))?
+        .collect();
 
-    addrs
-        .next()
-        .ok_or_else(|| PoolError::Resolve(format!("No addresses found for {}", host)))
+    if addrs.is_empty() {
+        return Err(PoolError::Resolve(format!("No addresses found for {}", host)));
+    }
+
+    Ok(addrs)
+}
+
+/// Happy Eyeballs connection: try all addresses with quick timeout
+async fn connect_with_happy_eyeballs(addrs: &[SocketAddr], _connect_timeout: Duration) -> Result<(TcpStream, SocketAddr), PoolError> {
+    let mut last_error = None;
+    
+    // Try each address with a short timeout (300ms per RFC 8305 recommendation)
+    for addr in addrs {
+        match tokio::time::timeout(
+            Duration::from_millis(300),
+            TcpStream::connect(addr)
+        ).await {
+            Ok(Ok(stream)) => {
+                trace!("Successfully connected to {}", addr);
+                return Ok((stream, *addr));
+            }
+            Ok(Err(e)) => {
+                trace!("Failed to connect to {}: {}", addr, e);
+                last_error = Some(e.to_string());
+            }
+            Err(_) => {
+                trace!("Timeout connecting to {}", addr);
+                last_error = Some(format!("Connection timeout to {}", addr));
+            }
+        }
+    }
+
+    // All addresses failed
+    Err(PoolError::Connect(
+        last_error.unwrap_or_else(|| "All resolved addresses failed".to_string())
+    ))
 }
 
 /// Validate resolved IP address to prevent DNS rebinding
@@ -541,40 +600,51 @@ mod tests {
     }
 
     // =====================================================================
-    // resolve_host tests
+    // resolve_host_all tests
     // =====================================================================
 
     #[tokio::test]
     async fn test_resolve_localhost() {
         // localhost should resolve
-        let result = resolve_host("localhost", 80).await;
+        let result = resolve_host_all("localhost", 80).await;
         assert!(result.is_ok());
 
-        let addr = result.unwrap();
-        assert_eq!(addr.port(), 80);
+        let addrs = result.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|addr| addr.port() == 80));
     }
 
     #[tokio::test]
     async fn test_resolve_ip_address() {
         // IP addresses should resolve immediately
-        let result = resolve_host("127.0.0.1", 8080).await;
+        let result = resolve_host_all("127.0.0.1", 8080).await;
         assert!(result.is_ok());
 
-        let addr = result.unwrap();
-        assert_eq!(addr.port(), 8080);
-        assert!(addr.ip().is_loopback());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].port(), 8080);
+        assert!(addrs[0].ip().is_loopback());
     }
 
     #[tokio::test]
     async fn test_resolve_invalid_host() {
         // Non-existent host should fail
-        let result = resolve_host("definitely-not-a-real-host-abc123xyz.invalid", 80).await;
+        let result = resolve_host_all("definitely-not-a-real-host-abc123xyz.invalid", 80).await;
         assert!(result.is_err());
 
         match result {
             Err(PoolError::Resolve(_)) => {}
             _ => panic!("Expected Resolve error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_happy_eyeballs_single_address() {
+        // Test with single address
+        let addrs = vec![SocketAddr::from(([127, 0, 0, 1], 1))];
+        let result = connect_with_happy_eyeballs(&addrs, Duration::from_secs(5)).await;
+        // This will fail because nothing is listening, but we're testing the logic
+        assert!(result.is_err());
     }
 
     // =====================================================================

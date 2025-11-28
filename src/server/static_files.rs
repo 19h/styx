@@ -145,12 +145,54 @@ async fn serve_file<B>(
         .first_or_octet_stream()
         .to_string();
 
+    let file_size = metadata.len();
+
+    // Parse Range header for partial content support (RFC 9110)
+    let range = request.headers().get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_range(s, file_size));
+
     // Create streaming body (no size limit needed - streaming prevents OOM)
-    let body = if request.method() == Method::HEAD {
+    let (body, status, content_length, content_range) = if request.method() == Method::HEAD {
         // HEAD requests have empty body
-        Full::new(Bytes::new()).map_err(|e| match e {}).boxed()
+        (
+            Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
+            if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK },
+            if let Some((start, end)) = range { end - start + 1 } else { file_size },
+            range.map(|(start, end)| format!("bytes {}-{}/{}", start, end, file_size)),
+        )
+    } else if let Some((start, end)) = range {
+        // Range request - return 206 Partial Content
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        
+        let mut file = File::open(&final_path)
+            .await
+            .map_err(|e| StaticFileError::IoError(e.to_string()))?;
+        
+        // Seek to start position
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| StaticFileError::IoError(e.to_string()))?;
+        
+        // Take only the requested range
+        let range_length = end - start + 1;
+        let limited_file = file.take(range_length);
+        let reader_stream = ReaderStream::new(limited_file);
+        
+        let frame_stream = reader_stream.map(|result| {
+            result
+                .map(|bytes| Frame::data(bytes))
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        });
+        
+        (
+            BodyExt::boxed(StreamBody::new(frame_stream)),
+            StatusCode::PARTIAL_CONTENT,
+            range_length,
+            Some(format!("bytes {}-{}/{}", start, end, file_size)),
+        )
     } else {
-        // Stream file contents in chunks
+        // Full file - stream file contents in chunks
         let file = File::open(&final_path)
             .await
             .map_err(|e| StaticFileError::IoError(e.to_string()))?;
@@ -165,14 +207,19 @@ async fn serve_file<B>(
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         });
         
-        BodyExt::boxed(StreamBody::new(frame_stream))
+        (
+            BodyExt::boxed(StreamBody::new(frame_stream)),
+            StatusCode::OK,
+            file_size,
+            None,
+        )
     };
 
     // Build response
     let mut response = Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, metadata.len().to_string());
+        .header(header::CONTENT_LENGTH, content_length.to_string());
 
     if is_gzipped {
         response = response.header(header::CONTENT_ENCODING, "gzip");
@@ -194,7 +241,62 @@ async fn serve_file<B>(
 
     response = response.header(header::ACCEPT_RANGES, "bytes");
 
+    // Add Content-Range header for partial content responses
+    if let Some(range_value) = content_range {
+        response = response.header(header::CONTENT_RANGE, range_value);
+    }
+
     Ok(response.body(body).unwrap())
+}
+
+/// Parse HTTP Range header (RFC 9110 Section 14.1.2)
+/// Only supports simple byte ranges: "bytes=start-end"
+/// Returns (start, end) inclusive, or None if invalid/unsatisfiable
+fn parse_range(range_header: &str, file_size: u64) -> Option<(u64, u64)> {
+    // Must start with "bytes="
+    let range_spec = range_header.strip_prefix("bytes=")?;
+    
+    // Only support single range (not multipart ranges)
+    if range_spec.contains(',') {
+        return None;
+    }
+    
+    // Parse "start-end" or "start-" or "-suffix"
+    let parts: Vec<&str> = range_spec.split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    
+    let (start_str, end_str) = (parts[0].trim(), parts[1].trim());
+    
+    let (start, end) = if start_str.is_empty() {
+        // Suffix range: "-500" means last 500 bytes
+        let suffix: u64 = end_str.parse().ok()?;
+        if suffix == 0 || suffix > file_size {
+            return None;
+        }
+        (file_size - suffix, file_size - 1)
+    } else if end_str.is_empty() {
+        // Open-ended range: "500-" means from byte 500 to end
+        let start: u64 = start_str.parse().ok()?;
+        if start >= file_size {
+            return None; // Range not satisfiable
+        }
+        (start, file_size - 1)
+    } else {
+        // Full range: "0-999"
+        let start: u64 = start_str.parse().ok()?;
+        let end: u64 = end_str.parse().ok()?;
+        
+        if start > end || start >= file_size {
+            return None; // Invalid or not satisfiable
+        }
+        
+        // Clamp end to file size
+        (start, end.min(file_size - 1))
+    };
+    
+    Some((start, end))
 }
 
 /// Directory entry for listing
@@ -781,6 +883,81 @@ mod tests {
     fn test_url_decode_null_byte() {
         // Null byte encoding (security concern)
         assert_eq!(urlencoding_decode("%00").unwrap(), "\0");
+    }
+
+    // =====================================================================
+    // parse_range tests
+    // =====================================================================
+
+    #[test]
+    fn test_parse_range_full_range() {
+        // "bytes=0-999" for a 1000 byte file
+        assert_eq!(parse_range("bytes=0-999", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=0-499", 1000), Some((0, 499)));
+        assert_eq!(parse_range("bytes=500-999", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_open_ended() {
+        // "bytes=500-" means from 500 to end
+        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(parse_range("bytes=0-", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=999-", 1000), Some((999, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_suffix() {
+        // "bytes=-500" means last 500 bytes
+        assert_eq!(parse_range("bytes=-500", 1000), Some((500, 999)));
+        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(parse_range("bytes=-1", 1000), Some((999, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_clamping() {
+        // End beyond file size should be clamped
+        assert_eq!(parse_range("bytes=0-9999", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=500-9999", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_invalid() {
+        // Invalid ranges should return None
+        assert_eq!(parse_range("bytes=1000-", 1000), None); // Start >= file_size
+        assert_eq!(parse_range("bytes=1000-1999", 1000), None); // Start >= file_size
+        assert_eq!(parse_range("bytes=500-400", 1000), None); // Start > end
+        assert_eq!(parse_range("bytes=-0", 1000), None); // Zero suffix
+        assert_eq!(parse_range("bytes=-1001", 1000), None); // Suffix > file_size
+    }
+
+    #[test]
+    fn test_parse_range_malformed() {
+        // Malformed ranges should return None
+        assert_eq!(parse_range("notbytes=0-100", 1000), None); // Wrong prefix
+        assert_eq!(parse_range("bytes=", 1000), None); // Empty range
+        assert_eq!(parse_range("bytes=0-100-200", 1000), None); // Too many parts
+        assert_eq!(parse_range("bytes=abc-def", 1000), None); // Non-numeric
+        assert_eq!(parse_range("bytes=0,100-200", 1000), None); // Multiple ranges (not supported)
+    }
+
+    #[test]
+    fn test_parse_range_whitespace() {
+        // Should handle whitespace
+        assert_eq!(parse_range("bytes= 0 - 100 ", 1000), Some((0, 100)));
+        assert_eq!(parse_range("bytes=  500  -  ", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_edge_cases() {
+        // Single byte file
+        assert_eq!(parse_range("bytes=0-0", 1), Some((0, 0)));
+        assert_eq!(parse_range("bytes=0-", 1), Some((0, 0)));
+        assert_eq!(parse_range("bytes=-1", 1), Some((0, 0)));
+        
+        // Large file
+        let large_size = 10_000_000_000u64; // 10GB
+        assert_eq!(parse_range("bytes=0-999", large_size), Some((0, 999)));
+        assert_eq!(parse_range(&format!("bytes=-1000"), large_size), Some((large_size - 1000, large_size - 1)));
     }
 
     // =====================================================================
