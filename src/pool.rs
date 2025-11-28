@@ -9,9 +9,9 @@ use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::client::conn::http1;
+use hyper::client::conn::{http1, http2};
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,7 +20,11 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
-use tracing::trace;
+use tracing::{debug, trace};
+
+/// ALPN protocol identifiers for client connections
+const ALPN_H2: &[u8] = b"h2";
+const ALPN_HTTP11: &[u8] = b"http/1.1";
 
 /// Configuration for the connection pool
 #[derive(Debug, Clone)]
@@ -46,9 +50,24 @@ impl Default for PoolConfig {
     }
 }
 
+/// Protocol version for pooled connections
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PooledProtocol {
+    Http1,
+    Http2,
+}
+
 /// A pooled HTTP/1.1 connection
-struct PooledConnection {
+struct PooledHttp1Connection {
     sender: http1::SendRequest<Full<Bytes>>,
+    #[allow(dead_code)]
+    created_at: Instant,
+    last_used: Instant,
+}
+
+/// A pooled HTTP/2 connection (multiplexed, can be shared)
+struct PooledHttp2Connection {
+    sender: http2::SendRequest<Full<Bytes>>,
     #[allow(dead_code)]
     created_at: Instant,
     last_used: Instant,
@@ -56,25 +75,31 @@ struct PooledConnection {
 
 /// Connection pool entry for a single host (lock-free design)
 struct HostPool {
-    /// Idle connections ready for reuse (lock-free queue)
-    idle: Arc<SegQueue<PooledConnection>>,
+    /// Idle HTTP/1.1 connections ready for reuse (lock-free queue)
+    idle_http1: Arc<SegQueue<PooledHttp1Connection>>,
+    /// HTTP/2 connection (multiplexed, one per host)
+    http2_conn: parking_lot::RwLock<Option<PooledHttp2Connection>>,
     /// Semaphore to limit concurrent connections
     semaphore: Arc<Semaphore>,
     /// Statistics
     hits: AtomicU64,
     misses: AtomicU64,
-    /// Current idle connection count (approximate)
+    /// Current idle HTTP/1.1 connection count (approximate)
     idle_count: AtomicUsize,
+    /// Whether this host supports HTTP/2 (discovered via ALPN)
+    supports_h2: parking_lot::RwLock<Option<bool>>,
 }
 
 impl HostPool {
     fn new(max_connections: usize) -> Self {
         Self {
-            idle: Arc::new(SegQueue::new()),
+            idle_http1: Arc::new(SegQueue::new()),
+            http2_conn: parking_lot::RwLock::new(None),
             semaphore: Arc::new(Semaphore::new(max_connections)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             idle_count: AtomicUsize::new(0),
+            supports_h2: parking_lot::RwLock::new(None),
         }
     }
 }
@@ -115,7 +140,7 @@ impl ConnectionPool {
             .clone()
     }
 
-    /// Send a request through the pool (lock-free)
+    /// Send a request through the pool (supports HTTP/1.1 and HTTP/2)
     pub async fn send_request(
         self: &Arc<Self>,
         host: &str,
@@ -128,10 +153,102 @@ impl ConnectionPool {
         let key = format!("{}:{}:{}", if use_tls { "https" } else { "http" }, host, port);
         let pool = self.get_or_create_pool(&key);
 
-        // Try to get an idle connection (lock-free!)
-        let mut conn = self.get_idle_connection(&pool);
+        // For TLS connections, try HTTP/2 first if supported
+        if use_tls {
+            // Check if we know this host supports HTTP/2
+            let supports_h2 = *pool.supports_h2.read();
+
+            if supports_h2 != Some(false) {
+                // Try to use existing HTTP/2 connection
+                if let Some(response) = self.try_http2_request(&pool, request.clone()).await {
+                    pool.hits.fetch_add(1, Ordering::Relaxed);
+                    return response;
+                }
+            }
+
+            // If we haven't discovered protocol support yet, try to establish HTTP/2
+            if supports_h2.is_none() {
+                match self.create_http2_connection(host, port).await {
+                    Ok(conn) => {
+                        *pool.supports_h2.write() = Some(true);
+                        debug!("Host {}:{} supports HTTP/2", host, port);
+
+                        let mut sender = conn.sender.clone();
+                        let response = sender.send_request(request).await.map_err(|e| {
+                            PoolError::Request(e.to_string())
+                        })?;
+
+                        // Store HTTP/2 connection for reuse
+                        *pool.http2_conn.write() = Some(conn);
+                        pool.hits.fetch_add(1, Ordering::Relaxed);
+                        self.active_connections.fetch_add(1, Ordering::Relaxed);
+
+                        return Ok(response);
+                    }
+                    Err(_) => {
+                        // HTTP/2 not supported, fall through to HTTP/1.1
+                        *pool.supports_h2.write() = Some(false);
+                        debug!("Host {}:{} does not support HTTP/2, using HTTP/1.1", host, port);
+                    }
+                }
+            }
+        }
+
+        // HTTP/1.1 path
+        self.send_http1_request(&pool, host, port, use_tls, request).await
+    }
+
+    /// Try to send request over existing HTTP/2 connection
+    async fn try_http2_request(
+        &self,
+        pool: &Arc<HostPool>,
+        request: Request<Full<Bytes>>,
+    ) -> Option<Result<Response<Incoming>, PoolError>> {
+        // Get the sender clone while holding the lock briefly
+        let sender_clone = {
+            let conn_guard = pool.http2_conn.read();
+            if let Some(conn) = conn_guard.as_ref() {
+                // Check if HTTP/2 connection is still usable
+                if conn.sender.is_ready() {
+                    Some(conn.sender.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+            // Lock is dropped here
+        };
+
+        // Now send the request without holding any locks
+        if let Some(mut sender) = sender_clone {
+            match sender.send_request(request).await {
+                Ok(response) => return Some(Ok(response)),
+                Err(e) => {
+                    // Connection failed, clear it
+                    *pool.http2_conn.write() = None;
+                    debug!("HTTP/2 connection failed: {}, will retry", e);
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Send request using HTTP/1.1
+    async fn send_http1_request(
+        self: &Arc<Self>,
+        pool: &Arc<HostPool>,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        request: Request<Full<Bytes>>,
+    ) -> Result<Response<Incoming>, PoolError> {
+        // Try to get an idle HTTP/1.1 connection
+        let mut conn = self.get_idle_http1_connection(pool);
         let semaphore = pool.semaphore.clone();
-        
+
         if conn.is_some() {
             pool.hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -140,7 +257,7 @@ impl ConnectionPool {
         if conn.is_none() {
             // Acquire semaphore permit with timeout
             let _permit = tokio::time::timeout(
-                Duration::from_secs(30), // Don't wait forever
+                Duration::from_secs(30),
                 semaphore.acquire_owned()
             )
             .await
@@ -149,7 +266,7 @@ impl ConnectionPool {
 
             pool.misses.fetch_add(1, Ordering::Relaxed);
 
-            conn = Some(self.create_connection(host, port, use_tls).await?);
+            conn = Some(self.create_http1_connection(host, port, use_tls).await?);
             self.active_connections.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -161,12 +278,12 @@ impl ConnectionPool {
             PoolError::Request(e.to_string())
         })?;
 
-        // Return connection to pool if still usable (lock-free!)
+        // Return connection to pool if still usable
         if sender.sender.is_ready() {
             sender.last_used = Instant::now();
             let current_idle = pool.idle_count.load(Ordering::Relaxed);
             if current_idle < self.config.max_idle_per_host {
-                pool.idle.push(sender);
+                pool.idle_http1.push(sender);
                 pool.idle_count.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -178,16 +295,16 @@ impl ConnectionPool {
         Ok(response)
     }
 
-    /// Get an idle connection from the pool (lock-free)
-    fn get_idle_connection(&self, pool: &Arc<HostPool>) -> Option<PooledConnection> {
+    /// Get an idle HTTP/1.1 connection from the pool
+    fn get_idle_http1_connection(&self, pool: &Arc<HostPool>) -> Option<PooledHttp1Connection> {
         let now = Instant::now();
 
         // Try to pop connections until we find a valid one
         loop {
-            match pool.idle.pop() {
+            match pool.idle_http1.pop() {
                 Some(conn) => {
                     pool.idle_count.fetch_sub(1, Ordering::Relaxed);
-                    
+
                     // Check if connection is still valid
                     if now.duration_since(conn.last_used) < self.config.idle_timeout
                         && conn.sender.is_ready()
@@ -202,8 +319,8 @@ impl ConnectionPool {
         }
     }
 
-    /// Create a new connection to the upstream
-    async fn create_connection(&self, host: &str, port: u16, use_tls: bool) -> Result<PooledConnection, PoolError> {
+    /// Create a new HTTP/1.1 connection to the upstream
+    async fn create_http1_connection(&self, host: &str, port: u16, use_tls: bool) -> Result<PooledHttp1Connection, PoolError> {
         // Resolve all addresses for Happy Eyeballs
         let addrs = resolve_host_all(host, port).await?;
 
@@ -225,7 +342,7 @@ impl ConnectionPool {
         stream.set_nodelay(true).ok();
 
         if use_tls {
-            // Create TLS connector with system root certificates
+            // Create TLS connector with HTTP/1.1 only ALPN
             let mut root_store = RootCertStore::empty();
             root_store.extend(
                 webpki_roots::TLS_SERVER_ROOTS
@@ -233,9 +350,12 @@ impl ConnectionPool {
                     .cloned()
             );
 
-            let config = ClientConfig::builder()
+            let mut config = ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
+
+            // Only advertise HTTP/1.1 for this connection type
+            config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
 
             let connector = TlsConnector::from(Arc::new(config));
 
@@ -261,7 +381,7 @@ impl ConnectionPool {
                 }
             });
 
-            Ok(PooledConnection {
+            Ok(PooledHttp1Connection {
                 sender,
                 created_at: Instant::now(),
                 last_used: Instant::now(),
@@ -281,12 +401,86 @@ impl ConnectionPool {
                 }
             });
 
-            Ok(PooledConnection {
+            Ok(PooledHttp1Connection {
                 sender,
                 created_at: Instant::now(),
                 last_used: Instant::now(),
             })
         }
+    }
+
+    /// Create a new HTTP/2 connection to the upstream (TLS only)
+    async fn create_http2_connection(&self, host: &str, port: u16) -> Result<PooledHttp2Connection, PoolError> {
+        // Resolve all addresses for Happy Eyeballs
+        let addrs = resolve_host_all(host, port).await?;
+
+        // Validate all resolved IPs to prevent DNS rebinding attacks
+        for addr in &addrs {
+            validate_resolved_ip(addr.ip())?;
+        }
+
+        // Happy Eyeballs: try all addresses with quick fallback
+        let (stream, _connected_addr) = tokio::time::timeout(
+            self.config.connect_timeout,
+            connect_with_happy_eyeballs(&addrs, self.config.connect_timeout),
+        )
+        .await
+        .map_err(|_| PoolError::ConnectTimeout)?
+        .map_err(|e| e)?;
+
+        // Set TCP options
+        stream.set_nodelay(true).ok();
+
+        // Create TLS connector with HTTP/2 ALPN
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(
+            webpki_roots::TLS_SERVER_ROOTS
+                .iter()
+                .cloned()
+        );
+
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        // Prefer HTTP/2, fall back to HTTP/1.1
+        config.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(config));
+
+        // Perform TLS handshake
+        let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| PoolError::Handshake("Invalid DNS name".to_string()))?;
+
+        let tls_stream = connector
+            .connect(domain, stream)
+            .await
+            .map_err(|e| PoolError::Handshake(format!("TLS handshake failed: {}", e)))?;
+
+        // Check if HTTP/2 was negotiated
+        let alpn = tls_stream.get_ref().1.alpn_protocol();
+        if alpn != Some(ALPN_H2) {
+            return Err(PoolError::Handshake("HTTP/2 not supported by server".to_string()));
+        }
+
+        let io = TokioIo::new(tls_stream);
+
+        let (sender, conn) = http2::handshake(TokioExecutor::new(), io)
+            .await
+            .map_err(|e| PoolError::Handshake(format!("HTTP/2 handshake failed: {}", e)))?;
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                trace!("HTTP/2 connection closed: {}", e);
+            }
+        });
+
+        Ok(PooledHttp2Connection {
+            sender,
+            created_at: Instant::now(),
+            last_used: Instant::now(),
+        })
     }
 
     /// Background cleanup of idle connections (lock-free)
@@ -303,10 +497,10 @@ impl ConnectionPool {
                 let mut removed = 0;
                 let mut valid_conns = Vec::new();
 
-                // Drain all connections from the queue
-                while let Some(conn) = pool.idle.pop() {
+                // Drain all HTTP/1.1 connections from the queue
+                while let Some(conn) = pool.idle_http1.pop() {
                     pool.idle_count.fetch_sub(1, Ordering::Relaxed);
-                    
+
                     if now.duration_since(conn.last_used) < self.config.idle_timeout
                         && conn.sender.is_ready()
                     {
@@ -320,8 +514,22 @@ impl ConnectionPool {
 
                 // Push valid connections back
                 for conn in valid_conns {
-                    pool.idle.push(conn);
+                    pool.idle_http1.push(conn);
                     pool.idle_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // Check HTTP/2 connection
+                {
+                    let mut h2_guard = pool.http2_conn.write();
+                    if let Some(ref conn) = *h2_guard {
+                        if now.duration_since(conn.last_used) >= self.config.idle_timeout
+                            || !conn.sender.is_ready()
+                        {
+                            *h2_guard = None;
+                            removed += 1;
+                            trace!("Cleaned up idle HTTP/2 connection for {}", entry.key());
+                        }
+                    }
                 }
 
                 if removed > 0 {
@@ -579,7 +787,8 @@ mod tests {
     fn test_host_pool_creation() {
         let pool = HostPool::new(100);
 
-        assert!(pool.idle.is_empty());
+        assert!(pool.idle_http1.is_empty());
+        assert!(pool.http2_conn.read().is_none());
         assert_eq!(pool.hits.load(Ordering::Relaxed), 0);
         assert_eq!(pool.misses.load(Ordering::Relaxed), 0);
     }

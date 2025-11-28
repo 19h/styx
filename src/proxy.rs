@@ -14,13 +14,17 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, Uri, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper::client::conn::{http1, http2};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+
+/// ALPN protocol identifiers
+const ALPN_H2: &[u8] = b"h2";
+const ALPN_HTTP11: &[u8] = b"http/1.1";
 
 /// Proxy configuration
 #[derive(Debug, Clone)]
@@ -314,6 +318,7 @@ impl ReverseProxy {
     }
 
     /// Send a streaming request using a direct connection (no pooling)
+    /// Supports HTTP/2 for TLS connections via ALPN negotiation
     async fn send_streaming_request(
         &self,
         host: &str,
@@ -327,11 +332,11 @@ impl ReverseProxy {
             .map_err(|e| ProxyError::Upstream(format!("DNS resolution failed: {}", e)))?
             .next()
             .ok_or_else(|| ProxyError::Upstream("No addresses resolved".to_string()))?;
-        
+
         // Validate resolved IP
         crate::pool::validate_resolved_ip(addr.ip())
             .map_err(|e| ProxyError::Upstream(e.to_string()))?;
-        
+
         // Connect to upstream
         let stream = tokio::time::timeout(
             Duration::from_secs(10),
@@ -340,62 +345,90 @@ impl ReverseProxy {
         .await
         .map_err(|_| ProxyError::Upstream("Connect timeout".to_string()))?
         .map_err(|e| ProxyError::Upstream(format!("Connect failed: {}", e)))?;
-        
+
         stream.set_nodelay(true).ok();
-        
+
         if use_tls {
-            // TLS connection
+            // TLS connection with HTTP/2 ALPN support
             let mut root_store = RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            
-            let config = ClientConfig::builder()
+
+            let mut config = ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            
+
+            // Prefer HTTP/2 for TLS connections
+            config.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+
             let connector = TlsConnector::from(Arc::new(config));
             let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|_| ProxyError::Upstream("Invalid DNS name".to_string()))?;
-            
+
             let tls_stream = connector
                 .connect(domain, stream)
                 .await
                 .map_err(|e| ProxyError::Upstream(format!("TLS handshake failed: {}", e)))?;
-            
-            let io = TokioIo::new(tls_stream);
-            
-            // HTTP/1 handshake
-            let (mut sender, conn) = http1::handshake(io)
-                .await
-                .map_err(|e| ProxyError::Upstream(format!("HTTP handshake failed: {}", e)))?;
-            
-            // Spawn connection task
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    tracing::debug!("Streaming connection error: {}", e);
-                }
-            });
-            
-            // Send request
-            sender
-                .send_request(request)
-                .await
-                .map_err(|e| ProxyError::Upstream(format!("Request failed: {}", e)))
+
+            // Check which protocol was negotiated
+            let alpn = tls_stream.get_ref().1.alpn_protocol();
+
+            if alpn == Some(ALPN_H2) {
+                // HTTP/2 connection
+                let io = TokioIo::new(tls_stream);
+
+                let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io)
+                    .await
+                    .map_err(|e| ProxyError::Upstream(format!("HTTP/2 handshake failed: {}", e)))?;
+
+                // Spawn connection task
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        tracing::debug!("HTTP/2 streaming connection error: {}", e);
+                    }
+                });
+
+                // Send request
+                sender
+                    .send_request(request)
+                    .await
+                    .map_err(|e| ProxyError::Upstream(format!("HTTP/2 request failed: {}", e)))
+            } else {
+                // HTTP/1.1 connection
+                let io = TokioIo::new(tls_stream);
+
+                let (mut sender, conn) = http1::handshake(io)
+                    .await
+                    .map_err(|e| ProxyError::Upstream(format!("HTTP handshake failed: {}", e)))?;
+
+                // Spawn connection task
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        tracing::debug!("Streaming connection error: {}", e);
+                    }
+                });
+
+                // Send request
+                sender
+                    .send_request(request)
+                    .await
+                    .map_err(|e| ProxyError::Upstream(format!("Request failed: {}", e)))
+            }
         } else {
-            // Plain HTTP connection
+            // Plain HTTP connection (HTTP/1.1 only, no h2c support for now)
             let io = TokioIo::new(stream);
-            
+
             // HTTP/1 handshake
             let (mut sender, conn) = http1::handshake(io)
                 .await
                 .map_err(|e| ProxyError::Upstream(format!("HTTP handshake failed: {}", e)))?;
-            
+
             // Spawn connection task
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
                     tracing::debug!("Streaming connection error: {}", e);
                 }
             });
-            
+
             // Send request
             sender
                 .send_request(request)

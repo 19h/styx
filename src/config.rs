@@ -218,6 +218,26 @@ pub struct Config {
     #[serde(default = "default_http2_idle_timeout")]
     pub http2_idle_timeout: u64,
 
+    /// Enable HTTP/2 support (default: on)
+    #[serde(default = "default_http2_enabled")]
+    pub http2_enabled: OnOff,
+
+    /// HTTP/2 maximum concurrent streams per connection
+    #[serde(default = "default_http2_max_concurrent_streams")]
+    pub http2_max_concurrent_streams: u32,
+
+    /// HTTP/2 initial stream window size in bytes
+    #[serde(default = "default_http2_initial_stream_window")]
+    pub http2_initial_stream_window: u32,
+
+    /// HTTP/2 initial connection window size in bytes
+    #[serde(default = "default_http2_initial_connection_window")]
+    pub http2_initial_connection_window: u32,
+
+    /// HTTP/2 max frame size in bytes (must be between 16KB and 16MB)
+    #[serde(default = "default_http2_max_frame_size")]
+    pub http2_max_frame_size: u32,
+
     /// Global proxy.preserve-host setting
     #[serde(default, rename = "proxy.preserve-host")]
     pub proxy_preserve_host: OnOff,
@@ -281,6 +301,26 @@ fn default_limit_request_body() -> u64 {
 
 fn default_http2_idle_timeout() -> u64 {
     180
+}
+
+fn default_http2_enabled() -> OnOff {
+    OnOff::On
+}
+
+fn default_http2_max_concurrent_streams() -> u32 {
+    256
+}
+
+fn default_http2_initial_stream_window() -> u32 {
+    1024 * 1024 // 1MB
+}
+
+fn default_http2_initial_connection_window() -> u32 {
+    2 * 1024 * 1024 // 2MB
+}
+
+fn default_http2_max_frame_size() -> u32 {
+    16 * 1024 // 16KB (HTTP/2 default)
 }
 
 fn default_proxy_timeout_io() -> u64 {
@@ -546,6 +586,38 @@ pub struct ResolvedConfig {
     pub hosts: HashMap<String, Arc<ResolvedHost>>,
     /// TCP proxy listeners
     pub tcp_listeners: Vec<ResolvedTcpListener>,
+    /// HTTP/2 settings
+    pub http2: Http2Config,
+}
+
+/// HTTP/2 configuration settings
+#[derive(Debug, Clone)]
+pub struct Http2Config {
+    /// Enable HTTP/2 support
+    pub enabled: bool,
+    /// Maximum concurrent streams per connection
+    pub max_concurrent_streams: u32,
+    /// Initial stream window size in bytes
+    pub initial_stream_window: u32,
+    /// Initial connection window size in bytes
+    pub initial_connection_window: u32,
+    /// Max frame size in bytes
+    pub max_frame_size: u32,
+    /// Idle timeout in seconds
+    pub idle_timeout: u64,
+}
+
+impl Default for Http2Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrent_streams: default_http2_max_concurrent_streams(),
+            initial_stream_window: default_http2_initial_stream_window(),
+            initial_connection_window: default_http2_initial_connection_window(),
+            max_frame_size: default_http2_max_frame_size(),
+            idle_timeout: default_http2_idle_timeout(),
+        }
+    }
 }
 
 /// Resolved TCP listener configuration
@@ -969,6 +1041,14 @@ impl Config {
             listeners,
             hosts,
             tcp_listeners,
+            http2: Http2Config {
+                enabled: self.http2_enabled.is_on(),
+                max_concurrent_streams: self.http2_max_concurrent_streams,
+                initial_stream_window: self.http2_initial_stream_window,
+                initial_connection_window: self.http2_initial_connection_window,
+                max_frame_size: self.http2_max_frame_size,
+                idle_timeout: self.http2_idle_timeout,
+            },
         })
     }
 }

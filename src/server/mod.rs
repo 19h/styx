@@ -12,14 +12,14 @@ use crate::middleware::{
 };
 use crate::proxy::{ProxyConfig, ProxyError, ReverseProxy};
 use crate::routing::{MatchResult, Router};
-use crate::tls::TlsManager;
+use crate::tls::{NegotiatedProtocol, TlsManager};
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use static_files::{serve_static, StaticFileConfig};
@@ -275,7 +275,7 @@ impl Server {
         Ok(())
     }
 
-    /// Handle a TLS connection
+    /// Handle a TLS connection with HTTP/2 support via ALPN
     async fn handle_tls_connection(
         self: Arc<Self>,
         stream: TcpStream,
@@ -307,11 +307,93 @@ impl Server {
             }
         };
 
+        // Check if HTTP/2 is enabled in config
+        if !self.config.http2.enabled {
+            // HTTP/2 disabled, always use HTTP/1.1
+            return self.handle_http1_tls_connection(tls_stream, peer_addr).await;
+        }
+
+        // Determine negotiated protocol from ALPN
+        let protocol = {
+            let (_, conn) = tls_stream.get_ref();
+            NegotiatedProtocol::from_alpn(conn.alpn_protocol())
+        };
+
+        trace!("TLS connection from {} using {:?}", peer_addr, protocol);
+
+        match protocol {
+            NegotiatedProtocol::H2 => {
+                self.handle_http2_connection(tls_stream, peer_addr).await
+            }
+            NegotiatedProtocol::Http1 => {
+                self.handle_http1_tls_connection(tls_stream, peer_addr).await
+            }
+        }
+    }
+
+    /// Handle HTTP/1.1 over TLS
+    async fn handle_http1_tls_connection<S>(
+        self: Arc<Self>,
+        tls_stream: S,
+        peer_addr: SocketAddr,
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let io = TokioIo::new(tls_stream);
         let server = Arc::clone(&self);
 
         let mut builder = http1::Builder::new();
         builder.keep_alive(true);
+
+        // Serve connection with overall timeout (5 minutes max per connection)
+        tokio::time::timeout(
+            Duration::from_secs(300),
+            builder.serve_connection(
+                io,
+                service_fn(move |req| {
+                    let server = Arc::clone(&server);
+                    // Per-request timeout (2 minutes)
+                    async move {
+                        tokio::time::timeout(
+                            Duration::from_secs(120),
+                            server.handle_request(req, peer_addr)
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Ok(error_response(StatusCode::REQUEST_TIMEOUT, "Request timeout")
+                                .map(|body| body.map_err(|e| match e {}).boxed()))
+                        })
+                    }
+                }),
+            )
+        )
+        .await??;
+
+        Ok(())
+    }
+
+    /// Handle HTTP/2 connection
+    async fn handle_http2_connection<S>(
+        self: Arc<Self>,
+        stream: S,
+        peer_addr: SocketAddr,
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = TokioIo::new(stream);
+        let server = Arc::clone(&self);
+
+        let mut builder = http2::Builder::new(TokioExecutor::new());
+
+        // HTTP/2 specific settings from config
+        let h2_config = &self.config.http2;
+        builder
+            .max_concurrent_streams(h2_config.max_concurrent_streams)
+            .initial_stream_window_size(h2_config.initial_stream_window)
+            .initial_connection_window_size(h2_config.initial_connection_window)
+            .max_frame_size(h2_config.max_frame_size);
 
         // Serve connection with overall timeout (5 minutes max per connection)
         tokio::time::timeout(

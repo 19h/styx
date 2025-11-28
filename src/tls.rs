@@ -5,6 +5,7 @@
 //! - Session resumption
 //! - Modern cipher suites
 //! - TLS 1.2 and 1.3
+//! - ALPN negotiation for HTTP/1.1 and HTTP/2
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -18,6 +19,27 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::info;
+
+/// ALPN protocol identifiers
+pub const ALPN_H2: &[u8] = b"h2";
+pub const ALPN_HTTP11: &[u8] = b"http/1.1";
+
+/// Negotiated protocol after TLS handshake
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiatedProtocol {
+    H2,
+    Http1,
+}
+
+impl NegotiatedProtocol {
+    /// Determine protocol from ALPN negotiation result
+    pub fn from_alpn(alpn: Option<&[u8]>) -> Self {
+        match alpn {
+            Some(ALPN_H2) => NegotiatedProtocol::H2,
+            _ => NegotiatedProtocol::Http1,
+        }
+    }
+}
 
 /// TLS configuration manager
 pub struct TlsManager {
@@ -126,11 +148,27 @@ impl TlsManager {
         Ok(())
     }
 
-    /// Build the server configuration
+    /// Build the server configuration with ALPN support for HTTP/2
     pub fn build_server_config(&self) -> anyhow::Result<Arc<ServerConfig>> {
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(self.resolver.clone());
+
+        // Enable ALPN for HTTP/2 and HTTP/1.1
+        // Order matters: h2 is preferred over http/1.1
+        config.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+
+        Ok(Arc::new(config))
+    }
+
+    /// Build the server configuration with HTTP/1.1 only (no HTTP/2)
+    pub fn build_server_config_http1_only(&self) -> anyhow::Result<Arc<ServerConfig>> {
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(self.resolver.clone());
+
+        // Only advertise HTTP/1.1
+        config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
 
         Ok(Arc::new(config))
     }
