@@ -238,6 +238,26 @@ pub struct Config {
     #[serde(default = "default_http2_max_frame_size")]
     pub http2_max_frame_size: u32,
 
+    /// Enable HTTP/3 support (default: off)
+    #[serde(default)]
+    pub http3_enabled: OnOff,
+
+    /// HTTP/3 maximum concurrent bidirectional streams per connection
+    #[serde(default = "default_http3_max_concurrent_streams")]
+    pub http3_max_concurrent_streams: u32,
+
+    /// HTTP/3 idle timeout in seconds
+    #[serde(default = "default_http3_idle_timeout")]
+    pub http3_idle_timeout: u64,
+
+    /// HTTP/3 initial stream receive window size in bytes
+    #[serde(default = "default_http3_stream_receive_window")]
+    pub http3_stream_receive_window: u32,
+
+    /// HTTP/3 initial connection receive window size in bytes
+    #[serde(default = "default_http3_connection_receive_window")]
+    pub http3_connection_receive_window: u32,
+
     /// Global proxy.preserve-host setting
     #[serde(default, rename = "proxy.preserve-host")]
     pub proxy_preserve_host: OnOff,
@@ -321,6 +341,22 @@ fn default_http2_initial_connection_window() -> u32 {
 
 fn default_http2_max_frame_size() -> u32 {
     16 * 1024 // 16KB (HTTP/2 default)
+}
+
+fn default_http3_max_concurrent_streams() -> u32 {
+    256
+}
+
+fn default_http3_idle_timeout() -> u64 {
+    30 // 30 seconds
+}
+
+fn default_http3_stream_receive_window() -> u32 {
+    1024 * 1024 // 1MB
+}
+
+fn default_http3_connection_receive_window() -> u32 {
+    2 * 1024 * 1024 // 2MB
 }
 
 fn default_proxy_timeout_io() -> u64 {
@@ -588,6 +624,8 @@ pub struct ResolvedConfig {
     pub tcp_listeners: Vec<ResolvedTcpListener>,
     /// HTTP/2 settings
     pub http2: Http2Config,
+    /// HTTP/3 settings
+    pub http3: Http3Config,
 }
 
 /// HTTP/2 configuration settings
@@ -616,6 +654,33 @@ impl Default for Http2Config {
             initial_connection_window: default_http2_initial_connection_window(),
             max_frame_size: default_http2_max_frame_size(),
             idle_timeout: default_http2_idle_timeout(),
+        }
+    }
+}
+
+/// HTTP/3 configuration settings
+#[derive(Debug, Clone)]
+pub struct Http3Config {
+    /// Enable HTTP/3 support
+    pub enabled: bool,
+    /// Maximum concurrent bidirectional streams per connection
+    pub max_concurrent_streams: u32,
+    /// Idle timeout in seconds
+    pub idle_timeout: u64,
+    /// Initial stream receive window size in bytes
+    pub stream_receive_window: u32,
+    /// Initial connection receive window size in bytes
+    pub connection_receive_window: u32,
+}
+
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent_streams: default_http3_max_concurrent_streams(),
+            idle_timeout: default_http3_idle_timeout(),
+            stream_receive_window: default_http3_stream_receive_window(),
+            connection_receive_window: default_http3_connection_receive_window(),
         }
     }
 }
@@ -1048,6 +1113,13 @@ impl Config {
                 initial_connection_window: self.http2_initial_connection_window,
                 max_frame_size: self.http2_max_frame_size,
                 idle_timeout: self.http2_idle_timeout,
+            },
+            http3: Http3Config {
+                enabled: self.http3_enabled.is_on(),
+                max_concurrent_streams: self.http3_max_concurrent_streams,
+                idle_timeout: self.http3_idle_timeout,
+                stream_receive_window: self.http3_stream_receive_window,
+                connection_receive_window: self.http3_connection_receive_window,
             },
         })
     }

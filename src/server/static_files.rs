@@ -724,6 +724,208 @@ impl StaticFileError {
     }
 }
 
+/// Serve a static file request for HTTP/3 (returns Bytes body instead of streaming)
+/// This is a simplified version that reads the entire file into memory
+pub async fn serve_static_h3<B>(
+    request: &Request<B>,
+    config: &StaticFileConfig,
+) -> Result<Response<Bytes>, StaticFileError> {
+    // Only allow GET and HEAD
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return Err(StaticFileError::MethodNotAllowed);
+    }
+
+    // Get request path and strip the matched route prefix
+    let full_path = request.uri().path();
+    let request_path = strip_prefix(full_path, &config.prefix);
+    let file_path = resolve_path(&config.root, request_path)?;
+
+    // Check if path is a directory
+    let metadata = tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|_| StaticFileError::NotFound)?;
+
+    // Handle directory - try index files first, then optionally show listing
+    if metadata.is_dir() {
+        if let Some(index_path) = find_index_file(&file_path, &config.index).await {
+            return serve_file_h3(request, &index_path, config).await;
+        }
+        // No index file found - generate directory listing if enabled
+        if config.dirlisting {
+            return generate_directory_listing_h3(request, &file_path, full_path).await;
+        }
+        return Err(StaticFileError::NotFound);
+    }
+
+    serve_file_h3(request, &file_path, config).await
+}
+
+/// Serve a specific file for HTTP/3
+async fn serve_file_h3<B>(
+    request: &Request<B>,
+    file_path: &Path,
+    config: &StaticFileConfig,
+) -> Result<Response<Bytes>, StaticFileError> {
+    let file_path = file_path.to_path_buf();
+
+    // Check for gzip version if client accepts it
+    let accepts_gzip = request
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("gzip"))
+        .unwrap_or(false);
+
+    let (final_path, is_gzipped) = if config.send_gzip && accepts_gzip {
+        let gzip_path = PathBuf::from(format!("{}.gz", file_path.display()));
+        if tokio::fs::metadata(&gzip_path).await.is_ok() {
+            (gzip_path, true)
+        } else {
+            (file_path, false)
+        }
+    } else {
+        (file_path, false)
+    };
+
+    // Get file metadata
+    let metadata = tokio::fs::metadata(&final_path)
+        .await
+        .map_err(|_| StaticFileError::NotFound)?;
+
+    if !metadata.is_file() {
+        return Err(StaticFileError::NotFound);
+    }
+
+    // Check conditional request headers
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    let etag = modified.map(|m| format!("\"{}{}\"", m, metadata.len()));
+
+    // Check If-None-Match
+    if let Some(inm) = request.headers().get(header::IF_NONE_MATCH) {
+        if let (Some(etag_value), Ok(inm_str)) = (&etag, inm.to_str()) {
+            if inm_str == etag_value || inm_str == "*" {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .body(Bytes::new())
+                    .unwrap());
+            }
+        }
+    }
+
+    // Determine content type from original path
+    let content_type = mime_guess::from_path(&final_path.to_string_lossy().replace(".gz", ""))
+        .first_or_octet_stream()
+        .to_string();
+
+    // Read file content
+    let body = if request.method() == Method::HEAD {
+        Bytes::new()
+    } else {
+        let content = tokio::fs::read(&final_path)
+            .await
+            .map_err(|e| StaticFileError::IoError(e.to_string()))?;
+        Bytes::from(content)
+    };
+
+    // Build response
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, metadata.len().to_string());
+
+    if is_gzipped {
+        response = response.header(header::CONTENT_ENCODING, "gzip");
+    }
+
+    if let Some(ref etag_value) = etag {
+        response = response.header(header::ETAG, etag_value.as_str());
+    }
+
+    if let Some(modified_secs) = modified {
+        let modified_time = chrono::DateTime::from_timestamp(modified_secs as i64, 0)
+            .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string());
+
+        if let Some(date_str) = modified_time {
+            response = response.header(header::LAST_MODIFIED, date_str);
+        }
+    }
+
+    response = response.header(header::ACCEPT_RANGES, "bytes");
+
+    Ok(response.body(body).unwrap())
+}
+
+/// Generate directory listing for HTTP/3
+async fn generate_directory_listing_h3<B>(
+    request: &Request<B>,
+    dir_path: &Path,
+    request_path: &str,
+) -> Result<Response<Bytes>, StaticFileError> {
+    let mut entries = Vec::new();
+
+    let mut read_dir = tokio::fs::read_dir(dir_path)
+        .await
+        .map_err(|e| StaticFileError::IoError(e.to_string()))?;
+
+    while let Some(entry) = read_dir.next_entry().await.map_err(|e| StaticFileError::IoError(e.to_string()))? {
+        let metadata = entry.metadata().await.ok();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let (is_dir, size, modified) = if let Some(meta) = metadata {
+            let modified = meta.modified().ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            (meta.is_dir(), meta.len(), modified)
+        } else {
+            (false, 0, None)
+        };
+
+        entries.push(DirEntry { name, is_dir, size, modified });
+    }
+
+    let query = request.uri().query().unwrap_or("");
+    let (sort_by, sort_dir) = parse_sort_params(query);
+
+    entries.sort_by(|a, b| {
+        match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let cmp = match sort_by {
+                    SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortBy::Size => a.size.cmp(&b.size),
+                    SortBy::Modified => a.modified.cmp(&b.modified),
+                };
+                if sort_dir == SortDir::Desc { cmp.reverse() } else { cmp }
+            }
+        }
+    });
+
+    let html = render_directory_html(request_path, &entries, sort_by, sort_dir);
+
+    let body = if request.method() == Method::HEAD {
+        Bytes::new()
+    } else {
+        Bytes::from(html)
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

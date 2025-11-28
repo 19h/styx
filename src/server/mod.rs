@@ -118,6 +118,16 @@ impl Server {
         })
     }
 
+    /// Get a reference to the router (for HTTP/3 server)
+    pub fn router(&self) -> Arc<Router> {
+        Arc::clone(&self.router)
+    }
+
+    /// Get a reference to the proxy (for HTTP/3 server)
+    pub fn proxy(&self) -> Arc<ReverseProxy> {
+        Arc::clone(&self.proxy)
+    }
+
     /// Run the server
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         info!("Starting styx reverse proxy");

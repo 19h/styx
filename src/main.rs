@@ -3,6 +3,7 @@
 //! A drop-in replacement for h2o with compatible configuration format.
 
 mod config;
+mod http3;
 mod middleware;
 mod pool;
 mod proxy;
@@ -134,7 +135,27 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Start HTTP server (only if there are HTTP hosts)
-        let server = server::Server::new(resolved);
+        let resolved_arc = std::sync::Arc::new(resolved);
+        let server = server::Server::new((*resolved_arc).clone());
+
+        // Start HTTP/3 server if enabled
+        if resolved_arc.http3.enabled {
+            let h3_config = resolved_arc.clone();
+            let h3_router = server.router();
+            let h3_proxy = server.proxy();
+
+            let h3_server = std::sync::Arc::new(http3::Http3Server::new(
+                h3_config,
+                h3_router,
+                h3_proxy,
+            ));
+
+            tokio::spawn(async move {
+                if let Err(e) = h3_server.run().await {
+                    error!("HTTP/3 server failed: {}", e);
+                }
+            });
+        }
 
         // Handle shutdown signal
         let _server_clone = server.clone();
