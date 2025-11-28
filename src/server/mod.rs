@@ -170,22 +170,17 @@ impl Server {
 
         // Build TLS acceptor if needed
         let tls_acceptor = if let Some(tls_cfg) = &tls_config {
-            // Load certificate for all hostnames that use this listener
-            // Find all hosts that listen on this address
+            // Load certificate for all hostnames that use this TLS listener
+            // Note: With Docker port forwarding, the config port (e.g., :4443) may differ
+            // from the actual listener port (e.g., 443), so we load all hostnames
+            // and rely on SNI matching at runtime
             for (host_name, _host_config) in &self.config.hosts {
                 // Parse hostname from "hostname:port" format
                 if let Some(colon_pos) = host_name.rfind(':') {
                     let hostname = &host_name[..colon_pos];
-                    let port_str = &host_name[colon_pos + 1..];
-
-                    // Check if this host uses this listener's port
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if addr.port() == port {
-                            // Load cert for this hostname
-                            self.tls_manager
-                                .load_cert(hostname, &tls_cfg.cert_path, &tls_cfg.key_path)?;
-                        }
-                    }
+                    // Load cert for this hostname - SNI will match the hostname part
+                    self.tls_manager
+                        .load_cert(hostname, &tls_cfg.cert_path, &tls_cfg.key_path)?;
                 }
             }
 
