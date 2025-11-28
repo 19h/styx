@@ -125,20 +125,32 @@ impl ReverseProxy {
         
         // Prepare headers
         let mut headers = request.headers().clone();
-        
+
+        // Extract original host from request BEFORE modifying headers (HTTP/2 uses :authority in URI, HTTP/1.1 uses Host header)
+        let original_host = request
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .or_else(|| {
+                headers
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+            });
+
         // Validate Host header
         if let Some(host_hdr) = headers.get(header::HOST) {
             if let Ok(host_str) = host_hdr.to_str() {
                 validate_host_header(host_str)?;
             }
         }
-        
+
         strip_forwarded_headers(&mut headers);
-        
+
         // Set host header
         if preserve_host {
-            if !headers.contains_key(header::HOST) {
-                if let Ok(host_value) = HeaderValue::from_str(&host) {
+            // Use original request host (from :authority or Host header)
+            if let Some(orig_host) = &original_host {
+                if let Ok(host_value) = HeaderValue::from_str(orig_host.as_str()) {
                     headers.insert(header::HOST, host_value);
                 }
             }
@@ -231,6 +243,17 @@ impl ReverseProxy {
         // Copy headers
         let mut headers = request.headers().clone();
 
+        // Extract original host from request BEFORE modifying headers (HTTP/2 uses :authority in URI, HTTP/1.1 uses Host header)
+        let original_host = request
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .or_else(|| {
+                headers
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+            });
+
         // Validate Host header to prevent injection attacks
         if let Some(host_hdr) = headers.get(header::HOST) {
             if let Ok(host_str) = host_hdr.to_str() {
@@ -243,9 +266,9 @@ impl ReverseProxy {
 
         // Set or preserve host header
         if preserve_host {
-            // Keep original Host header if present
-            if !headers.contains_key(header::HOST) {
-                if let Ok(host_value) = HeaderValue::from_str(&host) {
+            // Use original request host (from :authority or Host header)
+            if let Some(orig_host) = &original_host {
+                if let Ok(host_value) = HeaderValue::from_str(orig_host.as_str()) {
                     headers.insert(header::HOST, host_value);
                 }
             }
@@ -338,6 +361,16 @@ impl ReverseProxy {
         // Prepare headers
         let mut headers = headers;
 
+        // Extract original host from URI or headers BEFORE modifying headers (HTTP/2+ uses :authority in URI, HTTP/1.1 uses Host header)
+        let original_host = uri
+            .authority()
+            .map(|a| a.to_string())
+            .or_else(|| {
+                headers
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+            });
+
         // Validate Host header
         if let Some(host_hdr) = headers.get(header::HOST) {
             if let Ok(host_str) = host_hdr.to_str() {
@@ -349,8 +382,9 @@ impl ReverseProxy {
 
         // Set host header
         if preserve_host {
-            if !headers.contains_key(header::HOST) {
-                if let Ok(host_value) = HeaderValue::from_str(&host) {
+            // Use original request host (from :authority or Host header)
+            if let Some(orig_host) = &original_host {
+                if let Ok(host_value) = HeaderValue::from_str(orig_host.as_str()) {
                     headers.insert(header::HOST, host_value);
                 }
             }
