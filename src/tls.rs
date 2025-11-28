@@ -1,11 +1,18 @@
 //! TLS termination with SNI-based certificate selection
 //!
 //! This module provides TLS termination using rustls with support for:
-//! - SNI-based certificate selection
+//! - SNI-based certificate selection (exact and wildcard matching)
 //! - Session resumption
 //! - Modern cipher suites
 //! - TLS 1.2 and 1.3
 //! - ALPN negotiation for HTTP/1.1 and HTTP/2
+//!
+//! ## Security: Certificate Privacy
+//!
+//! Certificates are only returned when the SNI exactly matches a configured hostname.
+//! This prevents information disclosure about which domains are hosted on the server.
+//! Connections without matching SNI (including IP address connections) will fail the
+//! TLS handshake rather than leak certificate information.
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -61,8 +68,10 @@ pub struct TlsStats {
 pub struct SniResolver {
     /// Certified keys indexed by hostname
     certs: DashMap<String, Arc<rustls::sign::CertifiedKey>>,
-    /// Default certificate for unknown SNI
+    /// Default certificate for unknown SNI (None by default for security)
     default_cert: RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
+    /// Whether to use default certificate fallback (false by default to prevent info disclosure)
+    use_default_fallback: bool,
 }
 
 impl fmt::Debug for SniResolver {
@@ -70,15 +79,27 @@ impl fmt::Debug for SniResolver {
         f.debug_struct("SniResolver")
             .field("cert_count", &self.certs.len())
             .field("has_default", &self.default_cert.read().is_some())
+            .field("use_default_fallback", &self.use_default_fallback)
             .finish()
     }
 }
 
 impl SniResolver {
+    /// Create a new SNI resolver with default fallback disabled (secure by default)
     pub fn new() -> Self {
         Self {
             certs: DashMap::new(),
             default_cert: RwLock::new(None),
+            use_default_fallback: false,
+        }
+    }
+
+    /// Create a new SNI resolver with configurable default fallback behavior
+    pub fn with_default_fallback(use_fallback: bool) -> Self {
+        Self {
+            certs: DashMap::new(),
+            default_cert: RwLock::new(None),
+            use_default_fallback: use_fallback,
         }
     }
 
@@ -87,7 +108,7 @@ impl SniResolver {
         self.certs.insert(hostname.to_lowercase(), certified_key);
     }
 
-    /// Set the default certificate
+    /// Set the default certificate (only used if use_default_fallback is true)
     pub fn set_default(&self, certified_key: Arc<rustls::sign::CertifiedKey>) {
         *self.default_cert.write() = Some(certified_key);
     }
@@ -111,15 +132,38 @@ impl ResolvesServerCert for SniResolver {
             }
         }
 
-        // Fall back to default
-        self.default_cert.read().clone()
+        // Optionally fall back to default certificate
+        // By default this is disabled to prevent information disclosure
+        if self.use_default_fallback {
+            self.default_cert.read().clone()
+        } else {
+            None
+        }
     }
 }
 
 impl TlsManager {
-    /// Create a new TLS manager
+    /// Create a new TLS manager with default fallback disabled (secure by default)
     pub fn new() -> Self {
         let resolver = Arc::new(SniResolver::new());
+
+        Self {
+            resolver,
+            stats: TlsStats::default(),
+        }
+    }
+
+    /// Create a new TLS manager with configurable default certificate fallback
+    ///
+    /// # Arguments
+    /// * `use_default_fallback` - If true, connections with non-matching SNI will receive
+    ///   the default certificate. If false (recommended), they will be rejected.
+    ///
+    /// # Security
+    /// Setting this to `true` may leak information about which certificates exist on the server.
+    /// Only enable if you need backward compatibility with clients that don't support SNI.
+    pub fn with_default_fallback(use_fallback: bool) -> Self {
+        let resolver = Arc::new(SniResolver::with_default_fallback(use_fallback));
 
         Self {
             resolver,
@@ -367,6 +411,46 @@ mod tests {
         let result = load_private_key(&mut reader);
 
         assert!(result.is_err());
+    }
+
+    // =====================================================================
+    // Default fallback behavior tests
+    // =====================================================================
+
+    #[test]
+    fn test_resolver_secure_by_default() {
+        let resolver = SniResolver::new();
+        assert!(!resolver.use_default_fallback);
+    }
+
+    #[test]
+    fn test_resolver_with_fallback_enabled() {
+        let resolver = SniResolver::with_default_fallback(true);
+        assert!(resolver.use_default_fallback);
+    }
+
+    #[test]
+    fn test_resolver_with_fallback_disabled() {
+        let resolver = SniResolver::with_default_fallback(false);
+        assert!(!resolver.use_default_fallback);
+    }
+
+    #[test]
+    fn test_manager_secure_by_default() {
+        let manager = TlsManager::new();
+        assert!(!manager.resolver.use_default_fallback);
+    }
+
+    #[test]
+    fn test_manager_with_fallback_enabled() {
+        let manager = TlsManager::with_default_fallback(true);
+        assert!(manager.resolver.use_default_fallback);
+    }
+
+    #[test]
+    fn test_manager_with_fallback_disabled() {
+        let manager = TlsManager::with_default_fallback(false);
+        assert!(!manager.resolver.use_default_fallback);
     }
 
     // =====================================================================

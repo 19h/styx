@@ -698,6 +698,7 @@ cjSBFnGNTJhEj8LnALVkOW7VG8cWB0fZ/M7X9qvB3R0u9RvOYl5E
                 stream_receive_window: 1024 * 1024,
                 connection_receive_window: 2 * 1024 * 1024,
             },
+            sni_fallback: false,
         }
     }
 

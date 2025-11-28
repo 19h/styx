@@ -502,6 +502,12 @@ pub struct SslConfig {
 
     #[serde(default)]
     pub ocsp_update_interval: u64,
+
+    /// Enable default certificate fallback for non-matching SNI
+    /// WARNING: Enabling this may leak which certificates are hosted on the server
+    /// Default: OFF (secure)
+    #[serde(default, rename = "sni-fallback")]
+    pub sni_fallback: OnOff,
 }
 
 fn default_min_tls_version() -> String {
@@ -626,6 +632,8 @@ pub struct ResolvedConfig {
     pub http2: Http2Config,
     /// HTTP/3 settings
     pub http3: Http3Config,
+    /// SNI fallback setting (global across all listeners)
+    pub sni_fallback: bool,
 }
 
 /// HTTP/2 configuration settings
@@ -937,6 +945,7 @@ impl Config {
         let mut tcp_listeners = Vec::new();
         let mut seen_addrs = std::collections::HashSet::new();
         let mut seen_tcp_addrs = std::collections::HashSet::new();
+        let mut sni_fallback = false; // Default to secure mode
 
         for (host_name, host_config) in &self.hosts {
             // Parse host:port from name
@@ -991,6 +1000,12 @@ impl Config {
                             // Note: We currently ignore minimum_version as TlsManager uses a shared resolver
                             // Implementing per-listener TLS versions would require significant architectural changes
                             let _ = parse_tls_version(&ssl.minimum_version);
+
+                            // Capture SNI fallback setting from first SSL config found
+                            // This is global across all TLS listeners
+                            if !sni_fallback {
+                                sni_fallback = ssl.sni_fallback.is_on();
+                            }
 
                             Some(Arc::new(TlsListenerConfig {
                                 cert_path: ssl.certificate_file.clone(),
@@ -1121,6 +1136,7 @@ impl Config {
                 stream_receive_window: self.http3_stream_receive_window,
                 connection_receive_window: self.http3_connection_receive_window,
             },
+            sni_fallback,
         })
     }
 }
@@ -1983,11 +1999,13 @@ key-file: /tls/key.pem
         assert!(ssl.cipher_suite.is_none());
         assert!(ssl.dh_file.is_none());
         assert_eq!(ssl.ocsp_update_interval, 0);
+        assert!(!ssl.sni_fallback.is_on()); // Secure by default
     }
 
     #[test]
     fn test_ssl_config_full() {
         let yaml = r#"
+minimum-version: TLSv1.3
 cipher-preference: client
 cipher-suite: "TLS_AES_256_GCM_SHA384"
 dh-file: /tls/dhparams.pem
@@ -2002,6 +2020,28 @@ ocsp-update-interval: 3600
         assert_eq!(ssl.cipher_suite, Some("TLS_AES_256_GCM_SHA384".to_string()));
         assert_eq!(ssl.dh_file, Some(PathBuf::from("/tls/dhparams.pem")));
         assert_eq!(ssl.ocsp_update_interval, 3600);
+    }
+
+    #[test]
+    fn test_ssl_sni_fallback_enabled() {
+        let yaml = r#"
+certificate-file: /tls/cert.pem
+key-file: /tls/key.pem
+sni-fallback: ON
+"#;
+        let ssl: SslConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(ssl.sni_fallback.is_on());
+    }
+
+    #[test]
+    fn test_ssl_sni_fallback_disabled() {
+        let yaml = r#"
+certificate-file: /tls/cert.pem
+key-file: /tls/key.pem
+sni-fallback: OFF
+"#;
+        let ssl: SslConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!ssl.sni_fallback.is_on());
     }
 
     // =====================================================================

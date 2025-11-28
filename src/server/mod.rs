@@ -94,7 +94,7 @@ impl Server {
         };
         let proxy = ReverseProxy::new(proxy_config);
 
-        let tls_manager = Arc::new(TlsManager::new());
+        let tls_manager = Arc::new(TlsManager::with_default_fallback(config.sni_fallback));
 
         // Merge global headers with security defaults
         let global_headers = default_security_headers().merge_with(&config.global_headers);
