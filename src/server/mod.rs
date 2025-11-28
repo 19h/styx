@@ -455,10 +455,17 @@ impl Server {
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
+        // HTTP/2 uses :authority pseudo-header, HTTP/1.1 uses Host header
         let host = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|h: &HeaderValue| h.to_str().ok())
+            .uri()
+            .authority()
+            .map(|a| a.as_str())
+            .or_else(|| {
+                request
+                    .headers()
+                    .get(header::HOST)
+                    .and_then(|h: &HeaderValue| h.to_str().ok())
+            })
             .unwrap_or("");
 
         let path = request.uri().path();
