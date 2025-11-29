@@ -324,11 +324,6 @@ impl ConnectionPool {
         // Resolve all addresses for Happy Eyeballs
         let addrs = resolve_host_all(host, port).await?;
 
-        // Validate all resolved IPs to prevent DNS rebinding attacks
-        for addr in &addrs {
-            validate_resolved_ip(addr.ip())?;
-        }
-
         // Happy Eyeballs: try all addresses with quick fallback
         let (stream, _connected_addr) = tokio::time::timeout(
             self.config.connect_timeout,
@@ -413,11 +408,6 @@ impl ConnectionPool {
     async fn create_http2_connection(&self, host: &str, port: u16) -> Result<PooledHttp2Connection, PoolError> {
         // Resolve all addresses for Happy Eyeballs
         let addrs = resolve_host_all(host, port).await?;
-
-        // Validate all resolved IPs to prevent DNS rebinding attacks
-        for addr in &addrs {
-            validate_resolved_ip(addr.ip())?;
-        }
 
         // Happy Eyeballs: try all addresses with quick fallback
         let (stream, _connected_addr) = tokio::time::timeout(
@@ -591,71 +581,6 @@ async fn connect_with_happy_eyeballs(addrs: &[SocketAddr], _connect_timeout: Dur
     ))
 }
 
-/// Validate resolved IP address to prevent DNS rebinding
-pub fn validate_resolved_ip(ip: std::net::IpAddr) -> Result<(), PoolError> {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    match ip {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-
-            // Block private/internal IP ranges
-            if ipv4.is_loopback() // 127.0.0.0/8
-                || ipv4.is_private() // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                || ipv4.is_link_local() // 169.254.0.0/16
-                || ipv4.is_unspecified() // 0.0.0.0
-                || ipv4.is_broadcast() // 255.255.255.255
-                || octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127 // 100.64.0.0/10
-            {
-                return Err(PoolError::Connect(format!(
-                    "DNS resolved to blocked private IP: {}",
-                    ipv4
-                )));
-            }
-
-            // Block AWS metadata endpoint
-            if ipv4 == Ipv4Addr::new(169, 254, 169, 254) {
-                return Err(PoolError::Connect(
-                    "DNS resolved to metadata service endpoint".to_string()
-                ));
-            }
-        }
-        IpAddr::V6(ipv6) => {
-            // Block private/internal IPv6 ranges
-            if ipv6.is_loopback() // ::1
-                || ipv6.is_unspecified() // ::
-                || (ipv6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 (Unique local)
-                || (ipv6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (Link-local)
-            {
-                return Err(PoolError::Connect(format!(
-                    "DNS resolved to blocked private IPv6: {}",
-                    ipv6
-                )));
-            }
-
-            // Block IPv4-mapped IPv6 (::ffff:127.0.0.1)
-            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-                // Recursively validate the IPv4 address
-                return validate_resolved_ip(IpAddr::V4(ipv4));
-            }
-
-            // Block IPv4-compatible IPv6 (::127.0.0.1)
-            let segments = ipv6.segments();
-            if segments[0..6].iter().all(|&s| s == 0) {
-                // Last 32 bits contain IPv4
-                let ipv4 = Ipv4Addr::new(
-                    (segments[6] >> 8) as u8,
-                    segments[6] as u8,
-                    (segments[7] >> 8) as u8,
-                    segments[7] as u8,
-                );
-                return validate_resolved_ip(IpAddr::V4(ipv4));
-            }
-        }
-    }
-
-    Ok(())
-}
 
 /// Pool errors
 #[derive(Debug, thiserror::Error)]

@@ -130,16 +130,13 @@ impl ReverseProxy {
         // Prepare headers
         let mut headers = request.headers().clone();
 
-        // Extract original host from request BEFORE modifying headers (HTTP/2 uses :authority in URI, HTTP/1.1 uses Host header)
-        let original_host = request
-            .uri()
-            .authority()
-            .map(|a| a.to_string())
-            .or_else(|| {
-                headers
-                    .get(header::HOST)
-                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-            });
+        // Extract original host from request BEFORE modifying headers
+        // HTTP/2 uses :authority pseudo-header (may be in URI or headers), HTTP/1.1 uses Host header
+        let uri_authority = request.uri().authority().map(|a| a.to_string());
+        let host_header = headers.get(header::HOST).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let authority_header = headers.get(":authority").and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+
+        let original_host = uri_authority.or(host_header).or(authority_header);
 
         // Validate Host header
         if let Some(host_hdr) = headers.get(header::HOST) {
@@ -169,14 +166,14 @@ impl ReverseProxy {
             }
         }
 
-        add_forwarded_headers(&mut headers, &request, client_scheme);
+        add_forwarded_headers(&mut headers, client_scheme, original_host.as_deref());
 
         if let Some(ip) = client_ip {
             if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
                 headers.insert(HeaderName::from_static("x-forwarded-for"), value);
             }
         }
-        
+
         apply_request_headers(&mut headers, proxy_headers);
         remove_hop_headers(&mut headers);
 
@@ -276,16 +273,13 @@ impl ReverseProxy {
         // Copy headers
         let mut headers = request.headers().clone();
 
-        // Extract original host from request BEFORE modifying headers (HTTP/2 uses :authority in URI, HTTP/1.1 uses Host header)
-        let original_host = request
-            .uri()
-            .authority()
-            .map(|a| a.to_string())
-            .or_else(|| {
-                headers
-                    .get(header::HOST)
-                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-            });
+        // Extract original host from request BEFORE modifying headers
+        // HTTP/2 uses :authority pseudo-header (may be in URI or headers), HTTP/1.1 uses Host header
+        let uri_authority = request.uri().authority().map(|a| a.to_string());
+        let host_header = headers.get(header::HOST).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let authority_header = headers.get(":authority").and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+
+        let original_host = uri_authority.or(host_header).or(authority_header);
 
         // Validate Host header to prevent injection attacks
         if let Some(host_hdr) = headers.get(header::HOST) {
@@ -318,7 +312,7 @@ impl ReverseProxy {
         }
 
         // Add X-Forwarded headers (now trusted)
-        add_forwarded_headers(&mut headers, &request, client_scheme);
+        add_forwarded_headers(&mut headers, client_scheme, original_host.as_deref());
 
         // Add X-Forwarded-For with client IP
         if let Some(ip) = client_ip {
@@ -395,15 +389,12 @@ impl ReverseProxy {
         // Prepare headers
         let mut headers = headers;
 
-        // Extract original host from URI or headers BEFORE modifying headers (HTTP/2+ uses :authority in URI, HTTP/1.1 uses Host header)
-        let original_host = uri
-            .authority()
-            .map(|a| a.to_string())
-            .or_else(|| {
-                headers
-                    .get(header::HOST)
-                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-            });
+        // Extract original host from URI or headers BEFORE modifying headers
+        // HTTP/2+ uses :authority pseudo-header (may be in URI or headers), HTTP/1.1 uses Host header
+        let uri_authority = uri.authority().map(|a| a.to_string());
+        let host_header = headers.get(header::HOST).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let authority_header = headers.get(":authority").and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let original_host = uri_authority.or(host_header).or(authority_header);
 
         // Validate Host header
         if let Some(host_hdr) = headers.get(header::HOST) {
@@ -438,9 +429,11 @@ impl ReverseProxy {
             headers.insert(HeaderName::from_static("x-forwarded-proto"), value);
         }
 
-        // Add X-Forwarded-Host
-        if let Some(host_hdr) = headers.get(header::HOST) {
-            headers.insert(HeaderName::from_static("x-forwarded-host"), host_hdr.clone());
+        // Add X-Forwarded-Host from ORIGINAL client host (not the possibly-modified Host header)
+        if let Some(orig_host) = &original_host {
+            if let Ok(value) = HeaderValue::from_str(orig_host) {
+                headers.insert(HeaderName::from_static("x-forwarded-host"), value);
+            }
         }
 
         // Add X-Forwarded-For with client IP
@@ -524,10 +517,6 @@ impl ReverseProxy {
             .map_err(|e| ProxyError::Upstream(format!("DNS resolution failed: {}", e)))?
             .next()
             .ok_or_else(|| ProxyError::Upstream("No addresses resolved".to_string()))?;
-
-        // Validate resolved IP
-        crate::pool::validate_resolved_ip(addr.ip())
-            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
 
         // Connect to upstream
         let stream = tokio::time::timeout(
@@ -648,10 +637,6 @@ fn parse_upstream_url(upstream: &str, request_uri: &Uri) -> Result<String, Proxy
         .authority()
         .ok_or_else(|| ProxyError::InvalidUpstream("Missing authority in upstream URL".to_string()))?;
 
-    // Validate host to prevent SSRF to private/internal networks
-    let host = authority.host();
-    validate_upstream_host(host)?;
-
     // Get the path from upstream URL
     let upstream_path = upstream_uri.path();
 
@@ -679,58 +664,6 @@ fn parse_upstream_url(upstream: &str, request_uri: &Uri) -> Result<String, Proxy
         .unwrap_or_default();
 
     Ok(format!("{}://{}{}{}", scheme, authority, final_path, query))
-}
-
-/// Validate upstream host to prevent SSRF attacks
-fn validate_upstream_host(host: &str) -> Result<(), ProxyError> {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    // Try to parse as IP address
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(ipv4) => {
-                let octets = ipv4.octets();
-
-                // Block private/internal IP ranges
-                if ipv4.is_loopback() // 127.0.0.0/8
-                    || ipv4.is_private() // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                    || ipv4.is_link_local() // 169.254.0.0/16
-                    || ipv4.is_unspecified() // 0.0.0.0
-                    || ipv4.is_broadcast() // 255.255.255.255
-                    || octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127 // 100.64.0.0/10 (Carrier-grade NAT)
-                {
-                    return Err(ProxyError::InvalidUpstream(
-                        "Upstream host resolves to private/internal IP address".to_string()
-                    ));
-                }
-
-                // Specifically block AWS metadata endpoint
-                if ipv4 == Ipv4Addr::new(169, 254, 169, 254) {
-                    return Err(ProxyError::InvalidUpstream(
-                        "Upstream host is metadata service endpoint".to_string()
-                    ));
-                }
-            }
-            IpAddr::V6(ipv6) => {
-                // Block private/internal IPv6 ranges
-                if ipv6.is_loopback() // ::1
-                    || ipv6.is_unspecified() // ::
-                    || (ipv6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 (Unique local)
-                    || (ipv6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (Link-local)
-                {
-                    return Err(ProxyError::InvalidUpstream(
-                        "Upstream host resolves to private/internal IPv6 address".to_string()
-                    ));
-                }
-            }
-        }
-    }
-
-    // Note: For hostnames, we can't prevent DNS rebinding at parse time
-    // The actual connection will resolve DNS, which could rebind to internal IPs
-    // This is handled separately
-
-    Ok(())
 }
 
 /// Extract host and port from URI
@@ -867,7 +800,7 @@ fn strip_forwarded_headers(headers: &mut HeaderMap) {
 }
 
 /// Add X-Forwarded-* headers
-fn add_forwarded_headers<B>(headers: &mut HeaderMap, request: &Request<B>, client_scheme: &str) {
+fn add_forwarded_headers(headers: &mut HeaderMap, client_scheme: &str, original_host: Option<&str>) {
     // X-Forwarded-Proto - use the actual client scheme from the connection layer
     if let Ok(value) = HeaderValue::from_str(client_scheme) {
         headers.insert(
@@ -876,19 +809,15 @@ fn add_forwarded_headers<B>(headers: &mut HeaderMap, request: &Request<B>, clien
         );
     }
 
-    // X-Forwarded-Host (from original Host header)
-    if let Some(host_hdr) = headers.get(header::HOST) {
-        headers.insert(
-            HeaderName::from_static("x-forwarded-host"),
-            host_hdr.clone(),
-        );
+    // X-Forwarded-Host from ORIGINAL client host (not the possibly-modified Host header)
+    if let Some(orig_host) = original_host {
+        if let Ok(value) = HeaderValue::from_str(orig_host) {
+            headers.insert(
+                HeaderName::from_static("x-forwarded-host"),
+                value,
+            );
+        }
     }
-
-    // X-Forwarded-For - client IP
-    // Note: In a real deployment, this should be extracted from the connection peer address
-    // For now, we set it to indicate the proxy doesn't have the client IP yet
-    // This should be populated from peer_addr in the caller
-    // We leave a placeholder that should be filled by the caller with actual peer IP
 }
 
 /// Remove hop-by-hop headers
@@ -1208,14 +1137,8 @@ mod tests {
 
     #[test]
     fn test_add_forwarded_headers_http() {
-        let request = Request::builder()
-            .uri("http://example.com/path")
-            .header("host", "example.com")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-
-        let mut headers = request.headers().clone();
-        add_forwarded_headers(&mut headers, &request);
+        let mut headers = HeaderMap::new();
+        add_forwarded_headers(&mut headers, "http", Some("example.com"));
 
         assert_eq!(headers.get("x-forwarded-proto").unwrap(), "http");
         assert_eq!(headers.get("x-forwarded-host").unwrap(), "example.com");
@@ -1223,50 +1146,36 @@ mod tests {
 
     #[test]
     fn test_add_forwarded_headers_https() {
-        let request = Request::builder()
-            .uri("https://secure.example.com/path")
-            .header("host", "secure.example.com")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-
-        let mut headers = request.headers().clone();
-        add_forwarded_headers(&mut headers, &request);
+        let mut headers = HeaderMap::new();
+        add_forwarded_headers(&mut headers, "https", Some("secure.example.com"));
 
         assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(headers.get("x-forwarded-host").unwrap(), "secure.example.com");
     }
 
     #[test]
     fn test_add_forwarded_headers_overrides_client_headers() {
         // For security, we strip client-provided X-Forwarded headers
         // and set our own trusted values based on the actual request
-        let request = Request::builder()
-            .uri("http://example.com/path")
-            .header("host", "example.com")
-            .header("x-forwarded-proto", "https")  // Client tries to fake HTTPS
-            .header("x-forwarded-host", "original.example.com")  // Client tries to fake host
-            .body(Full::new(Bytes::new()))
-            .unwrap();
+        let mut headers = HeaderMap::new();
+        // Simulate client trying to fake headers (these would be stripped by strip_forwarded_headers before this call)
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("original.example.com"));
 
-        let mut headers = request.headers().clone();
-        add_forwarded_headers(&mut headers, &request);
+        add_forwarded_headers(&mut headers, "http", Some("example.com"));
 
         // Should override with actual request values, not preserve client values
-        assert_eq!(headers.get("x-forwarded-proto").unwrap(), "http");  // Actual proto from URI
-        assert_eq!(headers.get("x-forwarded-host").unwrap(), "example.com");  // Actual host header
+        assert_eq!(headers.get("x-forwarded-proto").unwrap(), "http");  // Actual proto
+        assert_eq!(headers.get("x-forwarded-host").unwrap(), "example.com");  // Actual host
     }
 
     #[test]
     fn test_add_forwarded_headers_no_host() {
-        let request = Request::builder()
-            .uri("/path")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-
-        let mut headers = request.headers().clone();
-        add_forwarded_headers(&mut headers, &request);
+        let mut headers = HeaderMap::new();
+        add_forwarded_headers(&mut headers, "http", None);
 
         assert_eq!(headers.get("x-forwarded-proto").unwrap(), "http");
-        // x-forwarded-host should not be set if no Host header
+        // x-forwarded-host should not be set if no original host
         assert!(headers.get("x-forwarded-host").is_none());
     }
 

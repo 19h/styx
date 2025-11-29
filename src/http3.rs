@@ -968,10 +968,10 @@ cjSBFnGNTJhEj8LnALVkOW7VG8cWB0fZ/M7X9qvB3R0u9RvOYl5E
             .body(())
             .unwrap();
 
-        // Invalid upstream URL that will fail validation
+        // Invalid upstream URL with malformed format
         let route = MatchResult {
             action: RouteAction::Proxy {
-                upstream: "http://127.0.0.1:99999".to_string(), // Invalid - localhost blocked
+                upstream: "not-a-valid-url".to_string(), // Invalid URL format
                 preserve_host: false,
             },
             headers: HeaderRules::default(),
@@ -983,7 +983,7 @@ cjSBFnGNTJhEj8LnALVkOW7VG8cWB0fZ/M7X9qvB3R0u9RvOYl5E
         let peer_addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let result = execute_action(&request, Bytes::new(), &route, &proxy, &config, peer_addr).await;
 
-        // Should fail due to SSRF protection (localhost is blocked)
+        // Should fail due to invalid URL format
         assert!(result.is_err());
     }
 

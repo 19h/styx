@@ -146,15 +146,36 @@ impl Router {
     /// Create a new router from resolved hosts
     pub fn new(hosts: &std::collections::HashMap<String, Arc<ResolvedHost>>) -> Self {
         let mut host_matchers = AHashMap::new();
+        // Track which port was used for hostname-only entries to prefer :443 over :80
+        let mut hostname_ports: AHashMap<String, u16> = AHashMap::new();
 
-        for (name, host) in hosts {
+        // Sort keys for deterministic iteration order
+        let mut sorted_keys: Vec<_> = hosts.keys().collect();
+        sorted_keys.sort();
+
+        for name in sorted_keys {
+            let host = &hosts[name];
             let matcher = Arc::new(RouteMatcher::new(host));
             host_matchers.insert(name.clone(), matcher.clone());
 
             // Also index by just hostname (without port)
+            // Prefer :443 over :80 since HTTP/2 over TLS omits the default port
             if let Some(idx) = name.rfind(':') {
                 let hostname = &name[..idx];
-                host_matchers.entry(hostname.to_string()).or_insert(matcher);
+                let port: u16 = name[idx + 1..].parse().unwrap_or(0);
+
+                let should_insert = match hostname_ports.get(hostname) {
+                    None => true,
+                    Some(&existing_port) => {
+                        // Prefer 443 over other ports, then prefer higher ports
+                        (port == 443 && existing_port != 443) || (existing_port != 443 && port > existing_port)
+                    }
+                };
+
+                if should_insert {
+                    host_matchers.insert(hostname.to_string(), matcher);
+                    hostname_ports.insert(hostname.to_string(), port);
+                }
             }
         }
 
