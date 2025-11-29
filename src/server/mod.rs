@@ -10,12 +10,15 @@ use crate::middleware::{
     apply_expires, apply_response_headers, default_security_headers, error_response,
     redirect_response, status_response,
 };
-use crate::proxy::{ProxyConfig, ProxyError, ReverseProxy};
+use crate::proxy::{
+    bidirectional_copy, is_websocket_upgrade, ProxyConfig, ProxyError, ReverseProxy,
+    WebSocketUpgradeResult,
+};
 use crate::routing::{MatchResult, Router};
 use crate::tls::{NegotiatedProtocol, TlsManager};
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -271,7 +274,7 @@ impl Server {
         }
     }
 
-    /// Handle a plain HTTP connection
+    /// Handle a plain HTTP connection (with WebSocket upgrade support)
     async fn handle_connection(
         self: Arc<Self>,
         stream: TcpStream,
@@ -286,13 +289,14 @@ impl Server {
         builder.keep_alive(true);
 
         // Serve connection with overall timeout (5 minutes max per connection)
+        // Use with_upgrades() to support WebSocket upgrades
         tokio::time::timeout(
             Duration::from_secs(300),
             builder.serve_connection(
                 io,
                 service_fn(move |req| {
                     let server = Arc::clone(&server);
-                    // Per-request timeout (2 minutes)
+                    // Per-request timeout (2 minutes) - but WebSocket upgrades bypass this
                     async move {
                         tokio::time::timeout(
                             Duration::from_secs(120),
@@ -306,6 +310,7 @@ impl Server {
                     }
                 }),
             )
+            .with_upgrades()
         )
         .await??;
 
@@ -368,7 +373,7 @@ impl Server {
         }
     }
 
-    /// Handle HTTP/1.1 over TLS
+    /// Handle HTTP/1.1 over TLS (with WebSocket upgrade support)
     async fn handle_http1_tls_connection<S>(
         self: Arc<Self>,
         tls_stream: S,
@@ -384,13 +389,14 @@ impl Server {
         builder.keep_alive(true);
 
         // Serve connection with overall timeout (5 minutes max per connection)
+        // Use with_upgrades() to support WebSocket upgrades (wss://)
         tokio::time::timeout(
             Duration::from_secs(300),
             builder.serve_connection(
                 io,
                 service_fn(move |req| {
                     let server = Arc::clone(&server);
-                    // Per-request timeout (2 minutes)
+                    // Per-request timeout (2 minutes) - but WebSocket upgrades bypass this
                     async move {
                         tokio::time::timeout(
                             Duration::from_secs(120),
@@ -404,6 +410,7 @@ impl Server {
                     }
                 }),
             )
+            .with_upgrades()
         )
         .await??;
 
@@ -585,7 +592,92 @@ impl Server {
             RouteAction::Proxy { upstream, preserve_host } => {
                 let merged_response_headers = self.global_headers.merge_with(&route.headers);
 
-                // Streaming proxy - no body buffering
+                // Check if this is a WebSocket upgrade request
+                if is_websocket_upgrade(&request) {
+                    trace!("WebSocket upgrade request from {} to {}", peer_addr, upstream);
+
+                    // Extract info we need from the request BEFORE getting the OnUpgrade
+                    let method = request.method().clone();
+                    let uri = request.uri().clone();
+                    let request_headers = request.headers().clone();
+
+                    // Get the OnUpgrade from the request - this consumes the request
+                    let on_upgrade = hyper::upgrade::on(request);
+
+                    // Handle WebSocket upgrade with the extracted info
+                    let result = self
+                        .proxy
+                        .proxy_websocket_with_info(
+                            method,
+                            &uri,
+                            &request_headers,
+                            upstream,
+                            *preserve_host,
+                            &route.proxy_headers,
+                            Some(peer_addr.ip()),
+                            client_scheme,
+                        )
+                        .await?;
+
+                    return match result {
+                        WebSocketUpgradeResult::Upgraded { upstream: mut upstream_conn } => {
+                            // Build a 101 Switching Protocols response
+                            let response = Response::builder()
+                                .status(StatusCode::SWITCHING_PROTOCOLS)
+                                .header(header::CONNECTION, "Upgrade")
+                                .header(header::UPGRADE, "websocket")
+                                .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+                                .unwrap();
+
+                            debug!("WebSocket upgrade to {} successful, starting tunnel", upstream);
+
+                            // Spawn a task to handle the bidirectional copy after upgrade completes
+                            let upstream_str = upstream.clone();
+                            tokio::spawn(async move {
+                                // Wait for the client upgrade to complete
+                                match on_upgrade.await {
+                                    Ok(upgraded) => {
+                                        let client = TokioIo::new(upgraded);
+                                        // Bidirectionally copy data between client and upstream
+                                        match bidirectional_copy(client, &mut *upstream_conn).await {
+                                            Ok((sent, recv)) => {
+                                                debug!(
+                                                    "WebSocket tunnel to {} closed (sent: {}, recv: {})",
+                                                    upstream_str, sent, recv
+                                                );
+                                            }
+                                            Err(e) => {
+                                                debug!(
+                                                    "WebSocket tunnel to {} error: {}",
+                                                    upstream_str, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("WebSocket client upgrade failed: {}", e);
+                                    }
+                                }
+                            });
+
+                            Ok(response)
+                        }
+                        WebSocketUpgradeResult::Rejected { status, headers, body } => {
+                            // Upstream rejected the upgrade - return their response
+                            debug!("WebSocket upgrade to {} rejected with status {}", upstream, status);
+                            let mut builder = Response::builder().status(status);
+                            for (name, value) in headers.iter() {
+                                builder = builder.header(name.clone(), value.clone());
+                            }
+                            let response = builder
+                                .body(Full::new(body).map_err(|e| match e {}).boxed())
+                                .unwrap();
+                            Ok(response)
+                        }
+                    };
+                }
+
+                // Normal HTTP proxy - no body buffering
                 let mut response: Response<Incoming> = self
                     .proxy
                     .proxy(

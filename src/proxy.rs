@@ -11,13 +11,14 @@ use crate::config::HeaderRules;
 use crate::middleware::{apply_request_headers, apply_response_headers};
 use crate::pool::{ConnectionPool, PoolConfig};
 use bytes::Bytes;
-use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, Uri, Version};
-use http_body_util::{BodyExt, Full};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
@@ -25,6 +26,44 @@ use tokio_rustls::TlsConnector;
 /// ALPN protocol identifiers
 const ALPN_H2: &[u8] = b"h2";
 const ALPN_HTTP11: &[u8] = b"http/1.1";
+
+/// Check if a request is a WebSocket upgrade request
+pub fn is_websocket_upgrade(request: &Request<Incoming>) -> bool {
+    let headers = request.headers();
+
+    // Check for Connection header containing "upgrade" (case-insensitive)
+    let has_connection_upgrade = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+
+    // Check for Upgrade header with value "websocket" (case-insensitive)
+    let has_upgrade_websocket = headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_lowercase() == "websocket")
+        .unwrap_or(false);
+
+    has_connection_upgrade && has_upgrade_websocket
+}
+
+/// Check if headers indicate a WebSocket upgrade (for internal use)
+fn is_websocket_headers(headers: &HeaderMap) -> bool {
+    let has_connection_upgrade = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+
+    let has_upgrade_websocket = headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_lowercase() == "websocket")
+        .unwrap_or(false);
+
+    has_connection_upgrade && has_upgrade_websocket
+}
 
 /// Proxy configuration
 #[derive(Debug, Clone)]
@@ -617,6 +656,286 @@ impl ReverseProxy {
                 .map_err(|e| ProxyError::Upstream(format!("Request failed: {}", e)))
         }
     }
+
+    /// Proxy a WebSocket upgrade request using pre-extracted request info
+    /// This variant allows the caller to keep the OnUpgrade from the original request
+    pub async fn proxy_websocket_with_info(
+        &self,
+        method: http::Method,
+        uri: &Uri,
+        request_headers: &HeaderMap,
+        upstream_url: &str,
+        preserve_host: bool,
+        proxy_headers: &HeaderRules,
+        client_ip: Option<std::net::IpAddr>,
+        client_scheme: &str,
+    ) -> Result<WebSocketUpgradeResult, ProxyError> {
+        // Parse upstream URL
+        let upstream = parse_upstream_url(upstream_url, uri)?;
+        let (host, port) = extract_host_port(&upstream)?;
+
+        // Prepare headers - preserve WebSocket-specific headers
+        let mut headers = request_headers.clone();
+
+        // Extract original host
+        let uri_authority = uri.authority().map(|a| a.to_string());
+        let host_header = headers.get(header::HOST).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let authority_header = headers.get(":authority").and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let original_host = uri_authority.or(host_header).or(authority_header);
+
+        // Validate Host header
+        if let Some(host_hdr) = headers.get(header::HOST) {
+            if let Ok(host_str) = host_hdr.to_str() {
+                validate_host_header(host_str)?;
+            }
+        }
+
+        strip_forwarded_headers(&mut headers);
+
+        // Set host header
+        if preserve_host {
+            if let Some(orig_host) = &original_host {
+                if let Ok(host_value) = HeaderValue::from_str(orig_host.as_str()) {
+                    headers.insert(header::HOST, host_value);
+                }
+            }
+        } else {
+            let host_with_port = if port == 80 || port == 443 {
+                host.clone()
+            } else {
+                format!("{}:{}", host, port)
+            };
+            if let Ok(host_value) = HeaderValue::from_str(&host_with_port) {
+                headers.insert(header::HOST, host_value);
+            }
+        }
+
+        add_forwarded_headers(&mut headers, client_scheme, original_host.as_deref());
+
+        if let Some(ip) = client_ip {
+            if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
+                headers.insert(HeaderName::from_static("x-forwarded-for"), value);
+            }
+        }
+
+        apply_request_headers(&mut headers, proxy_headers);
+
+        // Use WebSocket-aware hop header removal (preserves Upgrade and Connection: Upgrade)
+        remove_hop_headers_for_websocket(&mut headers);
+
+        // Build the upgrade request URI
+        let request_uri = if preserve_host {
+            let upstream_uri: Uri = upstream.parse()
+                .map_err(|e| ProxyError::InvalidUpstream(format!("Failed to parse upstream URL: {}", e)))?;
+            upstream_uri.path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string())
+        } else {
+            upstream.clone()
+        };
+
+        // Determine if upstream uses TLS
+        let parsed_upstream: Uri = upstream.parse().unwrap();
+        let use_tls = parsed_upstream.scheme_str() == Some("https");
+
+        // Connect to upstream and perform WebSocket handshake
+        let result = tokio::time::timeout(
+            self.config.io_timeout,
+            self.connect_websocket_upstream(&host, port, use_tls, method, &request_uri, headers),
+        )
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+        .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+
+        Ok(result)
+    }
+
+    /// Connect to upstream for WebSocket and return the upgrade result
+    async fn connect_websocket_upstream(
+        &self,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        method: http::Method,
+        uri: &str,
+        headers: HeaderMap,
+    ) -> Result<WebSocketUpgradeResult, String> {
+        // Resolve host
+        let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+            .await
+            .map_err(|e| format!("DNS resolution failed: {}", e))?
+            .next()
+            .ok_or_else(|| "No addresses resolved".to_string())?;
+
+        // Connect to upstream
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| "Connect timeout".to_string())?
+        .map_err(|e| format!("Connect failed: {}", e))?;
+
+        stream.set_nodelay(true).ok();
+
+        if use_tls {
+            // TLS connection - WebSocket over TLS (wss://)
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+            let mut config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            // HTTP/1.1 only for WebSocket (HTTP/2 doesn't support Upgrade mechanism)
+            config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+
+            let connector = TlsConnector::from(Arc::new(config));
+            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|_| "Invalid DNS name".to_string())?;
+
+            let tls_stream = connector
+                .connect(domain, stream)
+                .await
+                .map_err(|e| format!("TLS handshake failed: {}", e))?;
+
+            self.perform_websocket_handshake(tls_stream, method, uri, headers).await
+        } else {
+            // Plain HTTP connection
+            self.perform_websocket_handshake(stream, method, uri, headers).await
+        }
+    }
+
+    /// Perform the WebSocket handshake and return the result
+    async fn perform_websocket_handshake<S>(
+        &self,
+        stream: S,
+        method: http::Method,
+        uri: &str,
+        headers: HeaderMap,
+    ) -> Result<WebSocketUpgradeResult, String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = TokioIo::new(stream);
+
+        // Use HTTP/1.1 with upgrade support
+        let (mut sender, conn) = http1::Builder::new()
+            .handshake(io)
+            .await
+            .map_err(|e| format!("HTTP handshake failed: {}", e))?;
+
+        // Build the upgrade request
+        let mut request_builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .version(Version::HTTP_11);
+
+        for (name, value) in headers.iter() {
+            request_builder = request_builder.header(name.clone(), value.clone());
+        }
+
+        let proxy_request = request_builder
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| format!("Failed to build request: {}", e))?;
+
+        // Send the upgrade request
+        let response = sender
+            .send_request(proxy_request)
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+
+        // Check if upstream accepted the upgrade
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            // Get the upgraded connection from hyper
+            // The connection task will complete when the upgrade happens
+            let upgraded = hyper::upgrade::on(response)
+                .await
+                .map_err(|e| format!("Failed to upgrade connection: {}", e))?;
+
+            // Also wait for the connection to be ready for upgrade
+            // Spawn the connection so it can complete
+            tokio::spawn(async move {
+                if let Err(e) = conn.with_upgrades().await {
+                    tracing::debug!("WebSocket upstream connection error: {}", e);
+                }
+            });
+
+            Ok(WebSocketUpgradeResult::Upgraded {
+                upstream: Box::new(TokioIo::new(upgraded)),
+            })
+        } else {
+            // Upstream rejected the upgrade - return the response
+            // Spawn connection task for cleanup
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::debug!("WebSocket upstream connection error: {}", e);
+                }
+            });
+
+            let (parts, body) = response.into_parts();
+            let body_bytes = body.collect().await
+                .map_err(|e| format!("Failed to collect response body: {}", e))?
+                .to_bytes();
+
+            Ok(WebSocketUpgradeResult::Rejected {
+                status: parts.status,
+                headers: parts.headers,
+                body: body_bytes,
+            })
+        }
+    }
+}
+
+/// Result of a WebSocket upgrade attempt
+pub enum WebSocketUpgradeResult {
+    /// Upstream accepted the upgrade - contains the upgraded connection
+    Upgraded {
+        upstream: Box<dyn UpgradedConnection>,
+    },
+    /// Upstream rejected the upgrade - contains the response
+    Rejected {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+}
+
+/// Trait for upgraded connections that can be used for bidirectional copying
+pub trait UpgradedConnection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> UpgradedConnection for T {}
+
+/// Bidirectionally copy data between two streams (for WebSocket tunneling)
+pub async fn bidirectional_copy<C, S>(
+    client: C,
+    server: S,
+) -> std::io::Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut server_read, mut server_write) = tokio::io::split(server);
+
+    let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
+    let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
+
+    // Run both directions concurrently
+    // When one direction closes, we should close the other
+    tokio::select! {
+        result = client_to_server => {
+            let bytes_sent = result?;
+            // Client closed - shutdown server write
+            let _ = server_write.shutdown().await;
+            Ok((bytes_sent, 0))
+        }
+        result = server_to_client => {
+            let bytes_received = result?;
+            // Server closed - shutdown client write
+            let _ = client_write.shutdown().await;
+            Ok((0, bytes_received))
+        }
+    }
 }
 
 /// Parse upstream URL and combine with request path
@@ -822,7 +1141,18 @@ fn add_forwarded_headers(headers: &mut HeaderMap, client_scheme: &str, original_
 
 /// Remove hop-by-hop headers
 fn remove_hop_headers(headers: &mut HeaderMap) {
-    const HOP_HEADERS: &[&str] = &[
+    remove_hop_headers_impl(headers, false);
+}
+
+/// Remove hop-by-hop headers, optionally preserving WebSocket upgrade headers
+fn remove_hop_headers_for_websocket(headers: &mut HeaderMap) {
+    remove_hop_headers_impl(headers, true);
+}
+
+/// Internal implementation of hop-by-hop header removal
+fn remove_hop_headers_impl(headers: &mut HeaderMap, preserve_websocket: bool) {
+    // Standard hop-by-hop headers to remove
+    let mut hop_headers: Vec<&str> = vec![
         "keep-alive",
         "proxy-authenticate",
         "proxy-authorization",
@@ -830,7 +1160,6 @@ fn remove_hop_headers(headers: &mut HeaderMap) {
         "te",
         "trailers",
         "transfer-encoding",
-        "upgrade",
         "http2-settings",
         // Additional hop-by-hop headers
         "alt-svc",
@@ -839,8 +1168,13 @@ fn remove_hop_headers(headers: &mut HeaderMap) {
         "proxy-instruction",
     ];
 
+    // Only remove upgrade if we're not preserving WebSocket headers
+    if !preserve_websocket {
+        hop_headers.push("upgrade");
+    }
+
     // Remove standard hop-by-hop headers (connection handled separately below)
-    for header in HOP_HEADERS {
+    for header in &hop_headers {
         headers.remove(*header);
     }
 
@@ -853,14 +1187,28 @@ fn remove_hop_headers(headers: &mut HeaderMap) {
             for token in conn_str.split(',') {
                 let trimmed = token.trim().to_lowercase();
                 if !trimmed.is_empty() && trimmed != "connection" {
+                    // Don't remove upgrade header if preserving WebSocket
+                    if preserve_websocket && trimmed == "upgrade" {
+                        continue;
+                    }
                     headers_to_remove.push(trimmed);
                 }
             }
         }
     }
 
-    // Now remove the Connection header itself
-    headers.remove("connection");
+    // For WebSocket, preserve Connection: Upgrade
+    if preserve_websocket {
+        // Replace Connection header with just "Upgrade"
+        headers.remove("connection");
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("Upgrade"),
+        );
+    } else {
+        // Now remove the Connection header itself
+        headers.remove("connection");
+    }
 
     // Remove additional headers specified in Connection
     for header_name in headers_to_remove {
@@ -1272,5 +1620,149 @@ mod tests {
                 assert!(result.contains(query), "Query string '{}' not found in '{}'", query, result);
             }
         }
+    }
+
+    // =====================================================================
+    // WebSocket upgrade detection tests
+    // =====================================================================
+
+    #[test]
+    fn test_websocket_detection_valid_upgrade() {
+        // Create a mock request with WebSocket headers
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+
+        assert!(is_websocket_headers(&headers));
+    }
+
+    #[test]
+    fn test_websocket_detection_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("WebSocket"));
+
+        assert!(is_websocket_headers(&headers));
+    }
+
+    #[test]
+    fn test_websocket_detection_connection_with_multiple_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+
+        assert!(is_websocket_headers(&headers));
+    }
+
+    #[test]
+    fn test_websocket_detection_missing_upgrade_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        // Missing Upgrade header
+
+        assert!(!is_websocket_headers(&headers));
+    }
+
+    #[test]
+    fn test_websocket_detection_missing_connection_header() {
+        let mut headers = HeaderMap::new();
+        // Missing Connection header
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+
+        assert!(!is_websocket_headers(&headers));
+    }
+
+    #[test]
+    fn test_websocket_detection_wrong_upgrade_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("h2c"));  // Not WebSocket
+
+        assert!(!is_websocket_headers(&headers));
+    }
+
+    #[test]
+    fn test_websocket_detection_connection_without_upgrade() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+
+        assert!(!is_websocket_headers(&headers));
+    }
+
+    // =====================================================================
+    // WebSocket hop headers preservation tests
+    // =====================================================================
+
+    #[test]
+    fn test_remove_hop_headers_for_websocket_preserves_upgrade() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert("sec-websocket-key", HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="));
+        headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+
+        remove_hop_headers_for_websocket(&mut headers);
+
+        // Upgrade header should be preserved
+        assert!(headers.get(header::UPGRADE).is_some());
+        assert_eq!(headers.get(header::UPGRADE).unwrap(), "websocket");
+
+        // Connection header should be set to "Upgrade"
+        assert!(headers.get(header::CONNECTION).is_some());
+        assert_eq!(headers.get(header::CONNECTION).unwrap(), "Upgrade");
+
+        // WebSocket-specific headers should be preserved
+        assert!(headers.get("sec-websocket-key").is_some());
+        assert!(headers.get("sec-websocket-version").is_some());
+
+        // Other hop-by-hop headers should be removed
+        assert!(headers.get("keep-alive").is_none());
+
+        // Regular headers should remain
+        assert!(headers.get("content-type").is_some());
+    }
+
+    #[test]
+    fn test_remove_hop_headers_removes_upgrade_normally() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+
+        // Normal hop header removal (not WebSocket-aware)
+        remove_hop_headers(&mut headers);
+
+        // Upgrade header should be removed
+        assert!(headers.get(header::UPGRADE).is_none());
+
+        // Connection header should be removed
+        assert!(headers.get(header::CONNECTION).is_none());
+
+        // Regular headers should remain
+        assert!(headers.get("content-type").is_some());
+    }
+
+    #[test]
+    fn test_websocket_hop_headers_removes_other_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("te", HeaderValue::from_static("trailers"));
+
+        remove_hop_headers_for_websocket(&mut headers);
+
+        // Upgrade headers preserved
+        assert!(headers.get(header::UPGRADE).is_some());
+        assert!(headers.get(header::CONNECTION).is_some());
+
+        // Other hop-by-hop headers removed
+        assert!(headers.get("transfer-encoding").is_none());
+        assert!(headers.get("proxy-connection").is_none());
+        assert!(headers.get("te").is_none());
     }
 }
