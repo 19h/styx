@@ -447,6 +447,7 @@ async fn execute_action(
             let response_headers = HeaderRules::default();
 
             // Forward the request to the upstream
+            // HTTP/3 is always over QUIC/TLS, so client_scheme is always "https"
             let response = proxy.proxy_with_body(
                 request.method().clone(),
                 request.uri(),
@@ -457,6 +458,7 @@ async fn execute_action(
                 &merged_proxy_headers,
                 &response_headers,
                 Some(peer_addr.ip()),
+                "https",
             ).await?;
 
             // Apply response headers

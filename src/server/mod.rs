@@ -296,7 +296,7 @@ impl Server {
                     async move {
                         tokio::time::timeout(
                             Duration::from_secs(120),
-                            server.handle_request(req, peer_addr)
+                            server.handle_request(req, peer_addr, false)
                         )
                         .await
                         .unwrap_or_else(|_| {
@@ -394,7 +394,7 @@ impl Server {
                     async move {
                         tokio::time::timeout(
                             Duration::from_secs(120),
-                            server.handle_request(req, peer_addr)
+                            server.handle_request(req, peer_addr, true)
                         )
                         .await
                         .unwrap_or_else(|_| {
@@ -443,7 +443,7 @@ impl Server {
                     async move {
                         tokio::time::timeout(
                             Duration::from_secs(120),
-                            server.handle_request(req, peer_addr)
+                            server.handle_request(req, peer_addr, true)
                         )
                         .await
                         .unwrap_or_else(|_| {
@@ -464,6 +464,7 @@ impl Server {
         self: Arc<Self>,
         request: Request<Incoming>,
         peer_addr: SocketAddr,
+        is_tls: bool,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
@@ -495,7 +496,8 @@ impl Server {
         };
 
         // Execute the action
-        let response = match self.execute_action(request, &result, peer_addr).await {
+        let client_scheme = if is_tls { "https" } else { "http" };
+        let response = match self.execute_action(request, &result, peer_addr, client_scheme).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("Request error: {}", e);
@@ -514,6 +516,7 @@ impl Server {
         request: Request<Incoming>,
         route: &MatchResult,
         peer_addr: SocketAddr,
+        client_scheme: &str,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
         match &route.action {
             RouteAction::Redirect { url, status } => {
@@ -592,6 +595,7 @@ impl Server {
                         &route.proxy_headers,
                         &merged_response_headers,
                         Some(peer_addr.ip()), // Pass client IP for X-Forwarded-For
+                        client_scheme, // Pass client scheme for X-Forwarded-Proto
                     )
                     .await?;
 

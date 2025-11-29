@@ -76,16 +76,17 @@ impl ReverseProxy {
         proxy_headers: &HeaderRules,
         response_headers: &HeaderRules,
         client_ip: Option<std::net::IpAddr>,
+        client_scheme: &str,
     ) -> Result<Response<Incoming>, ProxyError> {
         // Check Content-Length to decide streaming strategy
         const STREAMING_THRESHOLD: u64 = 1024 * 1024; // 1MB
-        
+
         let content_length = request
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        
+
         // Use streaming for large bodies or if Content-Length is unknown
         if content_length.map(|len| len >= STREAMING_THRESHOLD).unwrap_or(false) {
             return self.proxy_streaming(
@@ -95,9 +96,10 @@ impl ReverseProxy {
                 proxy_headers,
                 response_headers,
                 client_ip,
+                client_scheme,
             ).await;
         }
-        
+
         // Use pooled connection for small bodies
         self.proxy_buffered(
             request,
@@ -106,6 +108,7 @@ impl ReverseProxy {
             proxy_headers,
             response_headers,
             client_ip,
+            client_scheme,
         ).await
     }
 
@@ -118,6 +121,7 @@ impl ReverseProxy {
         proxy_headers: &HeaderRules,
         response_headers: &HeaderRules,
         client_ip: Option<std::net::IpAddr>,
+        client_scheme: &str,
     ) -> Result<Response<Incoming>, ProxyError> {
         // Parse upstream URL
         let upstream = parse_upstream_url(upstream_url, request.uri())?;
@@ -164,9 +168,9 @@ impl ReverseProxy {
                 headers.insert(header::HOST, host_value);
             }
         }
-        
-        add_forwarded_headers(&mut headers, &request);
-        
+
+        add_forwarded_headers(&mut headers, &request, client_scheme);
+
         if let Some(ip) = client_ip {
             if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
                 headers.insert(HeaderName::from_static("x-forwarded-for"), value);
@@ -236,6 +240,7 @@ impl ReverseProxy {
         proxy_headers: &HeaderRules,
         response_headers: &HeaderRules,
         client_ip: Option<std::net::IpAddr>,
+        client_scheme: &str,
     ) -> Result<Response<Incoming>, ProxyError> {
         // Parse upstream URL
         let upstream = parse_upstream_url(upstream_url, request.uri())?;
@@ -313,7 +318,7 @@ impl ReverseProxy {
         }
 
         // Add X-Forwarded headers (now trusted)
-        add_forwarded_headers(&mut headers, &request);
+        add_forwarded_headers(&mut headers, &request, client_scheme);
 
         // Add X-Forwarded-For with client IP
         if let Some(ip) = client_ip {
@@ -381,6 +386,7 @@ impl ReverseProxy {
         proxy_headers: &HeaderRules,
         response_headers: &HeaderRules,
         client_ip: Option<std::net::IpAddr>,
+        client_scheme: &str,
     ) -> Result<Response<Bytes>, ProxyError> {
         // Parse upstream URL
         let upstream = parse_upstream_url(upstream_url, uri)?;
@@ -427,9 +433,8 @@ impl ReverseProxy {
             }
         }
 
-        // Manually add X-Forwarded-Proto
-        let proto = if uri.scheme_str() == Some("https") { "https" } else { "http" };
-        if let Ok(value) = HeaderValue::from_str(proto) {
+        // Add X-Forwarded-Proto using actual client scheme
+        if let Ok(value) = HeaderValue::from_str(client_scheme) {
             headers.insert(HeaderName::from_static("x-forwarded-proto"), value);
         }
 
@@ -438,6 +443,7 @@ impl ReverseProxy {
             headers.insert(HeaderName::from_static("x-forwarded-host"), host_hdr.clone());
         }
 
+        // Add X-Forwarded-For with client IP
         if let Some(ip) = client_ip {
             if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
                 headers.insert(HeaderName::from_static("x-forwarded-for"), value);
@@ -861,14 +867,9 @@ fn strip_forwarded_headers(headers: &mut HeaderMap) {
 }
 
 /// Add X-Forwarded-* headers
-fn add_forwarded_headers<B>(headers: &mut HeaderMap, request: &Request<B>) {
-    // X-Forwarded-Proto
-    let proto = if request.uri().scheme_str() == Some("https") {
-        "https"
-    } else {
-        "http"
-    };
-    if let Ok(value) = HeaderValue::from_str(proto) {
+fn add_forwarded_headers<B>(headers: &mut HeaderMap, request: &Request<B>, client_scheme: &str) {
+    // X-Forwarded-Proto - use the actual client scheme from the connection layer
+    if let Ok(value) = HeaderValue::from_str(client_scheme) {
         headers.insert(
             HeaderName::from_static("x-forwarded-proto"),
             value,
