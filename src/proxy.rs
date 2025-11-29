@@ -825,6 +825,14 @@ impl ReverseProxy {
             .await
             .map_err(|e| format!("HTTP handshake failed: {}", e))?;
 
+        // CRITICAL: Spawn the connection task BEFORE sending the request
+        // The connection task must be running to process the HTTP protocol
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!("WebSocket upstream connection error: {}", e);
+            }
+        });
+
         // Build the upgrade request
         let mut request_builder = Request::builder()
             .method(method)
@@ -848,31 +856,15 @@ impl ReverseProxy {
         // Check if upstream accepted the upgrade
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             // Get the upgraded connection from hyper
-            // The connection task will complete when the upgrade happens
             let upgraded = hyper::upgrade::on(response)
                 .await
                 .map_err(|e| format!("Failed to upgrade connection: {}", e))?;
-
-            // Also wait for the connection to be ready for upgrade
-            // Spawn the connection so it can complete
-            tokio::spawn(async move {
-                if let Err(e) = conn.with_upgrades().await {
-                    tracing::debug!("WebSocket upstream connection error: {}", e);
-                }
-            });
 
             Ok(WebSocketUpgradeResult::Upgraded {
                 upstream: Box::new(TokioIo::new(upgraded)),
             })
         } else {
             // Upstream rejected the upgrade - return the response
-            // Spawn connection task for cleanup
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    tracing::debug!("WebSocket upstream connection error: {}", e);
-                }
-            });
-
             let (parts, body) = response.into_parts();
             let body_bytes = body.collect().await
                 .map_err(|e| format!("Failed to collect response body: {}", e))?
