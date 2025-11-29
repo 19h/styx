@@ -69,6 +69,7 @@ fn normalize_ip_for_rate_limiting(ip: IpAddr) -> IpAddr {
 /// Main HTTP server
 pub struct Server {
     config: Arc<ResolvedConfig>,
+    raw_config: Arc<crate::config::Config>,
     router: Arc<Router>,
     proxy: Arc<ReverseProxy>,
     tls_manager: Arc<TlsManager>,
@@ -85,7 +86,7 @@ pub struct Server {
 
 impl Server {
     /// Create a new server from configuration
-    pub fn new(config: ResolvedConfig) -> Arc<Self> {
+    pub fn new(config: ResolvedConfig, raw_config: crate::config::Config) -> Arc<Self> {
         let router = Arc::new(Router::new(&config.hosts));
 
         let proxy_config = ProxyConfig {
@@ -105,6 +106,7 @@ impl Server {
         Arc::new(Self {
             max_body_size: config.limit_request_body,
             config: Arc::new(config),
+            raw_config: Arc::new(raw_config),
             router,
             proxy,
             tls_manager,
@@ -169,18 +171,28 @@ impl Server {
         info!("Listening on {}{}", addr, if tls_config.is_some() { " (TLS)" } else { "" });
 
         // Build TLS acceptor if needed
-        let tls_acceptor = if let Some(tls_cfg) = &tls_config {
-            // Load certificate for all hostnames that use this TLS listener
-            // Note: With Docker port forwarding, the config port (e.g., :4443) may differ
-            // from the actual listener port (e.g., 443), so we load all hostnames
-            // and rely on SNI matching at runtime
-            for (host_name, _host_config) in &self.config.hosts {
-                // Parse hostname from "hostname:port" format
-                if let Some(colon_pos) = host_name.rfind(':') {
-                    let hostname = &host_name[..colon_pos];
-                    // Load cert for this hostname - SNI will match the hostname part
-                    self.tls_manager
-                        .load_cert(hostname, &tls_cfg.cert_path, &tls_cfg.key_path)?;
+        let tls_acceptor = if tls_config.is_some() {
+            // Load certificates for ALL hostnames that have SSL configured on this listener
+            // This supports multiple certificates on the same port via SNI
+            for (host_name, host_value) in &self.raw_config.hosts {
+                // Check if this host has SSL configuration
+                if let Some(listen_value) = &host_value.listen {
+                    if let Ok(listen_config) = serde_yaml::from_value::<crate::config::ListenConfig>(listen_value.clone()) {
+                        // Check if this listen config matches our listener's address
+                        if listen_config.socket_addr() == addr {
+                            // This host uses this listener - load its certificate if it has SSL
+                            if let Some(ssl) = &listen_config.ssl {
+                                // Parse hostname from "hostname:port" format
+                                if let Some(colon_pos) = host_name.rfind(':') {
+                                    let hostname = &host_name[..colon_pos];
+                                    // Load this host's specific certificate
+                                    self.tls_manager
+                                        .load_cert(hostname, &ssl.certificate_file, &ssl.key_file)?;
+                                    info!("Loaded TLS certificate for {}", hostname);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

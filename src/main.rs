@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
 
         // Start HTTP server (only if there are HTTP hosts)
         let resolved_arc = std::sync::Arc::new(resolved);
-        let server = server::Server::new((*resolved_arc).clone());
+        let server = server::Server::new((*resolved_arc).clone(), config.clone());
 
         // Start HTTP/3 server if enabled
         if resolved_arc.http3.enabled {
