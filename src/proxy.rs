@@ -677,6 +677,12 @@ impl ReverseProxy {
         // Prepare headers - preserve WebSocket-specific headers
         let mut headers = request_headers.clone();
 
+        // Debug: Check for Cookie header
+        tracing::debug!(
+            "WebSocket headers received - Cookie present: {}",
+            headers.contains_key("cookie")
+        );
+
         // Extract original host
         let uri_authority = uri.authority().map(|a| a.to_string());
         let host_header = headers.get(header::HOST).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
@@ -722,6 +728,13 @@ impl ReverseProxy {
 
         // Use WebSocket-aware hop header removal (preserves Upgrade and Connection: Upgrade)
         remove_hop_headers_for_websocket(&mut headers);
+
+        // Debug: Check if Cookie header survived
+        tracing::debug!(
+            "WebSocket headers after processing - Cookie present: {}, headers: {:?}",
+            headers.contains_key("cookie"),
+            headers.keys().collect::<Vec<_>>()
+        );
 
         // Build the upgrade request URI
         let request_uri = if preserve_host {
@@ -846,6 +859,12 @@ impl ReverseProxy {
         let proxy_request = request_builder
             .body(Empty::<Bytes>::new())
             .map_err(|e| format!("Failed to build request: {}", e))?;
+
+        // Debug: Log the actual request being sent
+        tracing::debug!(
+            "Sending WebSocket upgrade to upstream - Cookie in request: {}",
+            proxy_request.headers().contains_key("cookie")
+        );
 
         // Send the upgrade request
         let response = sender

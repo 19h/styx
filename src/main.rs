@@ -49,6 +49,14 @@ struct Args {
     /// Number of worker threads (0 = auto-detect)
     #[arg(short = 'w', long, default_value = "0")]
     workers: usize,
+
+    /// Quick static file server mode: serve files from this directory
+    #[arg(short = 's', long = "serve")]
+    serve_dir: Option<PathBuf>,
+
+    /// Port for quick static server (default: 8080)
+    #[arg(short = 'p', long = "port", default_value = "8080")]
+    port: u16,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -65,6 +73,11 @@ fn main() -> anyhow::Result<()> {
     init_logging(&args.log_level, args.json_logs)?;
 
     info!("styx reverse proxy v{}", env!("CARGO_PKG_VERSION"));
+
+    // Quick static server mode
+    if let Some(serve_dir) = args.serve_dir {
+        return run_quick_static_server(serve_dir, args.port, args.workers);
+    }
 
     // Load configuration
     info!("Loading configuration from {:?}", args.config);
@@ -190,6 +203,119 @@ fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
             .with(fmt::layer().with_target(true).with_thread_ids(true))
             .init();
     }
+
+    Ok(())
+}
+
+/// Quick static file server mode - lightweight server without config file
+fn run_quick_static_server(dir: PathBuf, port: u16, workers: usize) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use http::{Request, Response};
+    use http_body_util::{BodyExt, Full};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use server::static_files::{serve_static, StaticFileConfig, StaticFileError};
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    // Resolve directory path
+    let root = std::fs::canonicalize(&dir).map_err(|e| {
+        anyhow::anyhow!("Cannot access directory '{}': {}", dir.display(), e)
+    })?;
+
+    info!("Quick static server mode");
+    info!("Serving files from: {}", root.display());
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    // Determine worker threads
+    let workers = if workers == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        workers
+    };
+
+    // Build runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async move {
+        let listener = TcpListener::bind(addr).await?;
+        info!("Listening on http://{}", addr);
+
+        let static_config = StaticFileConfig {
+            root,
+            index: vec!["index.html".to_string(), "index.htm".to_string()],
+            send_gzip: true,
+            dirlisting: true,
+            prefix: "/".to_string(),
+        };
+        let static_config = std::sync::Arc::new(static_config);
+
+        // Handle shutdown signal
+        tokio::spawn(async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                error!("Failed to listen for ctrl-c: {}", e);
+                return;
+            }
+            info!("Received shutdown signal");
+            std::process::exit(0);
+        });
+
+        loop {
+            let (stream, remote_addr) = listener.accept().await?;
+            let config = std::sync::Arc::clone(&static_config);
+
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let config = std::sync::Arc::clone(&config);
+                    async move {
+                        let response = match serve_static(&req, &config).await {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                let status = e.status_code();
+                                let body = match e {
+                                    StaticFileError::NotFound => "404 Not Found",
+                                    StaticFileError::Forbidden => "403 Forbidden",
+                                    StaticFileError::MethodNotAllowed => "405 Method Not Allowed",
+                                    StaticFileError::IoError(_) => "500 Internal Server Error",
+                                };
+                                Response::builder()
+                                    .status(status)
+                                    .header("content-type", "text/plain")
+                                    .body(
+                                        Full::new(Bytes::from(body))
+                                            .map_err(|e| match e {})
+                                            .boxed(),
+                                    )
+                                    .unwrap()
+                            }
+                        };
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+
+                let io = TokioIo::new(stream);
+                if let Err(e) = http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await
+                {
+                    if !e.to_string().contains("connection closed") {
+                        error!("Connection error from {}: {}", remote_addr, e);
+                    }
+                }
+            });
+        }
+
+        #[allow(unreachable_code)]
+        Ok::<_, anyhow::Error>(())
+    })?;
 
     Ok(())
 }
