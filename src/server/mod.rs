@@ -476,7 +476,7 @@ impl Server {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
         // HTTP/2 uses :authority pseudo-header, HTTP/1.1 uses Host header
-        let host = request
+        let raw_host = request
             .uri()
             .authority()
             .map(|a| a.as_str())
@@ -488,12 +488,29 @@ impl Server {
             })
             .unwrap_or("");
 
+        // SECURITY: Normalize host by appending default port if missing.
+        // This ensures HTTP requests route to :80 configs and HTTPS to :443 configs,
+        // preventing HTTP requests from accessing HTTPS-only paths.
+        //
+        // Example: Request to http://example.com/secret should route to example.com:80,
+        // not fall through to example.com:443 via hostname-only lookup.
+        let host: std::borrow::Cow<'_, str> = if raw_host.contains(':') {
+            // Host already has a port
+            std::borrow::Cow::Borrowed(raw_host)
+        } else if raw_host.is_empty() {
+            std::borrow::Cow::Borrowed(raw_host)
+        } else {
+            // Append default port based on TLS status
+            let default_port = if is_tls { 443 } else { 80 };
+            std::borrow::Cow::Owned(format!("{}:{}", raw_host, default_port))
+        };
+
         let path = request.uri().path();
 
         trace!("Request: {} {} {} from {}", request.method(), host, path, peer_addr);
 
         // Route the request
-        let result = match self.router.route(host, path) {
+        let result = match self.router.route(&host, path) {
             Some(r) => r,
             None => {
                 debug!("No route for {} {}", host, path);
