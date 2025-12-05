@@ -187,15 +187,25 @@ impl Router {
 
     /// Route a request
     pub fn route(&self, host: &str, path: &str) -> Option<MatchResult> {
-        // Try exact host:port match
+        // Try exact host:port match first
         if let Some(matcher) = self.hosts.get(host) {
             if let Some(result) = matcher.match_path(path) {
                 trace!("Matched {} {} -> {:?}", host, path, result.matched_path);
                 return Some(result);
             }
+            // SECURITY: If exact host:port exists but path doesn't match, do NOT
+            // fallback to hostname-only. This prevents HTTP requests from accessing
+            // paths that are only configured on HTTPS hosts.
+            //
+            // Example: psychonautwiki.org:80 has "/" redirect, psychonautwiki.org:443
+            // has "/log-ingest". Without this check, HTTP requests to :80 for
+            // "/log-ingest" would fallback to the :443 config.
+            trace!("Exact host {} matched but no route for path {}", host, path);
+            return None;
         }
 
-        // Try hostname only (strip port)
+        // Try hostname only (strip port) - but ONLY if exact host:port was not found.
+        // This supports HTTP/2 over TLS which omits the default port (443).
         if let Some(idx) = host.rfind(':') {
             let hostname = &host[..idx];
             if let Some(matcher) = self.hosts.get(hostname) {
@@ -1103,5 +1113,198 @@ mod tests {
 
         let router = Router::new(&hosts);
         assert!(router.route("192.168.1.1:8080", "/").is_some());
+    }
+
+    // =====================================================================
+    // Security tests
+    // =====================================================================
+
+    #[test]
+    fn test_security_http_does_not_leak_to_https_paths() {
+        // This test ensures that paths configured only on HTTPS (port 443)
+        // are NOT accessible via HTTP (port 80).
+        //
+        // Scenario:
+        // - example.com:80 has only specific paths (no catch-all "/")
+        // - example.com:443 has "/" and "/secret-admin"
+        //
+        // A request to example.com:80 for "/secret-admin" should return None,
+        // NOT fallback to the :443 config.
+        //
+        // Note: If HTTP host has "/" route, it catches all paths (intended behavior).
+        // This test covers the case where HTTP host has LIMITED paths only.
+
+        let mut hosts = std::collections::HashMap::new();
+
+        // HTTP host with LIMITED paths (no catch-all "/")
+        // This is the vulnerable scenario - only specific paths exposed on HTTP
+        hosts.insert(
+            "example.com:80".to_string(),
+            Arc::new(ResolvedHost {
+                routes: vec![
+                    ResolvedRoute {
+                        path: "/.well-known".to_string(),
+                        action: RouteAction::StaticFiles {
+                            dir: "/acme".into(),
+                            index: vec![],
+                            send_gzip: false,
+                            dirlisting: false,
+                        },
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                    ResolvedRoute {
+                        path: "/public".to_string(),
+                        action: RouteAction::Proxy {
+                            upstream: "http://public:80".to_string(),
+                            preserve_host: true,
+                        },
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                ],
+                headers: HeaderRules::default(),
+            }),
+        );
+
+        // HTTPS host with more paths (including sensitive ones)
+        hosts.insert(
+            "example.com:443".to_string(),
+            Arc::new(ResolvedHost {
+                routes: vec![
+                    ResolvedRoute {
+                        path: "/".to_string(),
+                        action: RouteAction::Proxy {
+                            upstream: "http://backend:80".to_string(),
+                            preserve_host: true,
+                        },
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                    ResolvedRoute {
+                        path: "/secret-admin".to_string(),
+                        action: RouteAction::Proxy {
+                            upstream: "http://admin-backend:80".to_string(),
+                            preserve_host: true,
+                        },
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                    ResolvedRoute {
+                        path: "/log-ingest".to_string(),
+                        action: RouteAction::Proxy {
+                            upstream: "http://elasticsearch:9200".to_string(),
+                            preserve_host: true,
+                        },
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                ],
+                headers: HeaderRules::default(),
+            }),
+        );
+
+        let router = Router::new(&hosts);
+
+        // HTTP requests to :80 should only see paths defined on :80
+        assert!(router.route("example.com:80", "/.well-known/acme").is_some());
+        assert!(router.route("example.com:80", "/public").is_some());
+        assert!(router.route("example.com:80", "/public/page").is_some());
+
+        // CRITICAL: These paths exist ONLY on :443 and should NOT be accessible via :80
+        // Before fix: These would fallback to :443 config and expose sensitive endpoints
+        assert!(
+            router.route("example.com:80", "/secret-admin").is_none(),
+            "SECURITY: /secret-admin should NOT be accessible via HTTP port 80"
+        );
+        assert!(
+            router.route("example.com:80", "/log-ingest").is_none(),
+            "SECURITY: /log-ingest should NOT be accessible via HTTP port 80"
+        );
+        assert!(
+            router.route("example.com:80", "/").is_none(),
+            "SECURITY: / from :443 should NOT be accessible via HTTP port 80"
+        );
+
+        // HTTPS requests to :443 should see all paths
+        assert!(router.route("example.com:443", "/").is_some());
+        assert!(router.route("example.com:443", "/secret-admin").is_some());
+        assert!(router.route("example.com:443", "/log-ingest").is_some());
+
+        // HTTP/2 over TLS may omit the port - hostname-only should work for :443
+        // when there's no :443 entry but there is a hostname entry
+        assert!(router.route("example.com", "/").is_some());
+        assert!(router.route("example.com", "/secret-admin").is_some());
+    }
+
+    #[test]
+    fn test_security_no_fallback_when_exact_host_exists() {
+        // Test that having an exact host:port match prevents fallback to
+        // hostname-only, even if the path doesn't match.
+
+        let mut hosts = std::collections::HashMap::new();
+
+        // Only :80 host defined, but with limited routes
+        hosts.insert(
+            "limited.com:80".to_string(),
+            Arc::new(ResolvedHost {
+                routes: vec![
+                    ResolvedRoute {
+                        path: "/public".to_string(),
+                        action: RouteAction::Status,
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                ],
+                headers: HeaderRules::default(),
+            }),
+        );
+
+        // :443 host with more routes
+        hosts.insert(
+            "limited.com:443".to_string(),
+            Arc::new(ResolvedHost {
+                routes: vec![
+                    ResolvedRoute {
+                        path: "/".to_string(),
+                        action: RouteAction::Status,
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                    ResolvedRoute {
+                        path: "/private".to_string(),
+                        action: RouteAction::Status,
+                        headers: HeaderRules::default(),
+                        proxy_headers: HeaderRules::default(),
+                        expires: None,
+                    },
+                ],
+                headers: HeaderRules::default(),
+            }),
+        );
+
+        let router = Router::new(&hosts);
+
+        // :80 only has /public - request for /private should return None
+        assert!(router.route("limited.com:80", "/public").is_some());
+        assert!(
+            router.route("limited.com:80", "/private").is_none(),
+            "Should NOT fallback to :443 config when :80 exists"
+        );
+        assert!(
+            router.route("limited.com:80", "/").is_none(),
+            "Should NOT fallback to :443 config's / route"
+        );
+
+        // :443 has both
+        assert!(router.route("limited.com:443", "/").is_some());
+        assert!(router.route("limited.com:443", "/private").is_some());
     }
 }
